@@ -1,0 +1,10 @@
+# Python / venv
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Extra YOLO weights are downloaded on first use (yolov8m.pt is committed)
+yolov8n.pt
+yolov8s.pt
+data_cache/

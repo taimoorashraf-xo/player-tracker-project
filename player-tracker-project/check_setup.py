@@ -54,6 +54,9 @@ def main():
         ("DeepSort", "deep_sort_realtime"),
         ("SciPy", "scipy"),
         ("Pillow", "PIL"),
+        ("StatsBombPy", "statsbombpy"),
+        ("imageio", "imageio"),
+        ("imageio-ffmpeg", "imageio_ffmpeg"),
     ]
     
     results = []
