@@ -8,9 +8,10 @@ Real-time player detection, tracking, and analysis from video files.
 ✅ **Persistent Tracking** - Deep SORT multi-object tracking  
 ✅ **Shirt Number OCR** - Automatic shirt number extraction  
 ✅ **Team Detection** - Color-based team classification  
-✅ **Live Preview** - Watch detection as it happens  
+✅ **Annotated Video** - Smooth playback of the result, with a download button  
+✅ **Live Preview (optional)** - Watch frames while processing  
 ✅ **Statistics** - Frame counts, detection rates, CSV export  
-✅ **Speed control** - Process every Nth frame to trade precision for speed  
+✅ **Speed controls** - Choose the model size, video width and how many frames to analyse  
 
 ## Requirements
 
@@ -56,12 +57,20 @@ Browser opens at: `http://localhost:8501`
 ## Usage
 
 1. **Upload Video** - MP4/AVI/MOV/MKV format
-2. **Click Process** - App detects and tracks players
-3. **Watch Live Preview** - See bounding boxes in real-time
-4. **View Statistics** - Get final player stats
-5. **Download CSV** - Export results
+2. **Pick settings** - See "Speed settings" below
+3. **Click Process** - The app detects and tracks players
+4. **Watch the annotated video** - Plays smoothly when processing finishes
+5. **View Statistics / Download CSV** - Export results
 
-Use **Process every N frames** to speed things up. The default of 3 processes every third frame. Set it to 1 for maximum precision, which is much slower on CPU.
+### Speed settings
+
+The app analyses frames one at a time, which is slow on a CPU, so the live preview is choppy by nature. The finished annotated video plays smoothly.
+
+- **Detection model** - Nano is the fastest, Medium the most accurate. Nano and Small weights download automatically the first time you pick them.
+- **Max video width** - Wider videos are scaled down. Smaller is faster.
+- **Analyse every N frames** - 1 analyses every frame (slowest, most precise). With 3, two of every three frames reuse the latest boxes, so the output video stays smooth but boxes can lag slightly on fast movement.
+- **Show live preview** - Off by default because sending frames to the browser slows processing.
+- A CUDA GPU speeds everything up a lot; the page shows whether the app is running on GPU or CPU.
 
 ## Video Requirements
 
@@ -115,7 +124,7 @@ streamlit run player_tracker_final.py --server.port 8502
 ```
 player-tracker-project/
 ├── player_tracker_final.py    (Main app)
-├── yolov8m.pt                  (YOLOv8 medium weights)
+├── yolov8m.pt                  (YOLOv8 medium weights; nano/small download on first use)
 ├── requirements.txt            (Dependencies)
 ├── README.md                   (This file)
 ├── check_setup.py              (Verification script)
@@ -133,7 +142,7 @@ player-tracker-project/
 
 ## Performance
 
-Processing time depends heavily on resolution, CPU/GPU and the "Process every N frames" setting. Measure on your own machine before relying on a time estimate. Each processed frame runs YOLOv8m detection plus DeepSort, so CPU-only runs on long videos take a while.
+Processing time depends heavily on the model size, video width, CPU/GPU and the "Analyse every N frames" setting. Measure on your own machine before relying on a time estimate. Each processed frame runs YOLOv8m detection plus DeepSort, so CPU-only runs on long videos take a while.
 
 ## Notes
 

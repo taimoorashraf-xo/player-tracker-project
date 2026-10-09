@@ -7,6 +7,7 @@ import easyocr
 import numpy as np
 import pandas as pd
 import streamlit as st
+import torch
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics import YOLO
 
@@ -14,9 +15,15 @@ from ultralytics import YOLO
 # SETTINGS
 # =====================================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "yolov8m.pt")
 
-MAX_WIDTH = 1280            # frames wider than this are scaled down (aspect kept)
+# Smaller models are much faster on CPU; the weights download on first use.
+MODEL_CHOICES = {
+    "Nano - fastest": "yolov8n.pt",
+    "Small - balanced": "yolov8s.pt",
+    "Medium - most accurate": "yolov8m.pt",
+}
+WIDTH_CHOICES = [480, 640, 960, 1280]   # frames wider than this are scaled down
+
 PERSON_CONF = 0.4           # YOLO confidence threshold for "person"
 OCR_EVERY_N_FRAMES = 10     # try reading a shirt number on every Nth frame per track
 OCR_MAX_ATTEMPTS = 10       # give up on a track after this many OCR attempts
@@ -66,25 +73,30 @@ def shirt_area(crop):
     return torso if torso.size else None
 
 
+def draw_players(frame, players):
+    """Return a copy of frame with a labelled box for each player."""
+    annotated = frame.copy()
+    for track_id, info in players.items():
+        x1, y1, x2, y2 = info["bbox"]
+        color = TEAM_BOX_COLORS.get(info["team"], TEAM_BOX_COLORS["Unknown"])
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        label = f"ID:{track_id} | #{info['shirt_number']} | {info['team']}"
+        cv2.putText(
+            annotated, label, (x1, max(25, y1 - 10)),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
+        )
+    return annotated
+
+
 # =====================================================
 # PLAYER TRACKER CLASS
 # =====================================================
 class PlayerTracker:
 
-    def __init__(self):
-        self.warnings = []
-        self.model = YOLO(MODEL_PATH)
-        self.ocr = self._load_ocr()
+    def __init__(self, model, ocr):
+        self.model = model
+        self.ocr = ocr          # may be None, in which case shirt numbers are skipped
         self.reset()
-
-    def _load_ocr(self):
-        try:
-            return easyocr.Reader(["en"], gpu=False)
-        except Exception as e:
-            self.warnings.append(
-                f"Shirt-number OCR is disabled because EasyOCR failed to load: {e}"
-            )
-            return None
 
     def reset(self):
         """Clear all tracking state so a new video starts from scratch."""
@@ -127,7 +139,7 @@ class PlayerTracker:
         return str(int(best_text)).zfill(2) if best_text else None
 
     def process_frame(self, frame):
-        """Detect, track and annotate one frame. Returns (annotated_frame, players)."""
+        """Detect and track players in one frame. Returns (annotated_frame, players)."""
         self.frames_processed += 1
 
         results = self.model(frame, classes=[0], conf=PERSON_CONF, verbose=False)
@@ -142,7 +154,6 @@ class PlayerTracker:
 
         tracks = self.deepsort.update_tracks(detection_list, frame=frame)
 
-        annotated = frame.copy()
         players = {}
         frame_h, frame_w = frame.shape[:2]
 
@@ -173,24 +184,13 @@ class PlayerTracker:
                 if number:
                     state["numbers"][number] += 1
 
-            team_now = _majority(state["teams"]) or "Unknown"
-            number_now = _majority(state["numbers"]) or "?"
-
             players[track_id] = {
                 "bbox": (x1, y1, x2, y2),
-                "team": team_now,
-                "shirt_number": number_now,
+                "team": _majority(state["teams"]) or "Unknown",
+                "shirt_number": _majority(state["numbers"]) or "?",
             }
 
-            color = TEAM_BOX_COLORS.get(team_now, TEAM_BOX_COLORS["Unknown"])
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-            label = f"ID:{track_id} | #{number_now} | {team_now}"
-            cv2.putText(
-                annotated, label, (x1, max(25, y1 - 10)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
-            )
-
-        return annotated, players
+        return draw_players(frame, players), players
 
     def get_stats(self):
         """One row per tracked player, sorted by how often they were seen."""
@@ -213,23 +213,50 @@ class PlayerTracker:
 
 
 # =====================================================
-# CACHE
+# CACHED MODEL LOADERS
 # =====================================================
 @st.cache_resource(show_spinner=False)
-def load_tracker():
-    return PlayerTracker()
+def load_yolo(model_name):
+    # Missing weights are downloaded next to this script on first use
+    return YOLO(os.path.join(BASE_DIR, model_name))
+
+
+@st.cache_resource(show_spinner=False)
+def load_ocr():
+    """Returns (reader, error_message). The reader is None if EasyOCR failed to load."""
+    try:
+        return easyocr.Reader(["en"], gpu=False), None
+    except Exception as e:
+        return None, f"Shirt-number OCR is disabled because EasyOCR failed to load: {e}"
 
 
 # =====================================================
 # VIDEO PROCESSING
 # =====================================================
-def process_video(tracker, video_file, stride):
-    """Run the tracker over an uploaded video. Returns the stats DataFrame."""
+def open_video_writer(path, fps):
+    """H.264 writer that browsers can play. Returns None if the encoder is unavailable."""
+    try:
+        import imageio
+        return imageio.get_writer(path, fps=fps, codec="libx264", macro_block_size=1)
+    except Exception as e:
+        st.warning(f"Could not create the output video ({e}). Statistics will still be produced.")
+        return None
+
+
+def process_video(tracker, video_file, stride, max_width, show_preview):
+    """Run the tracker over an uploaded video.
+
+    Returns {"stats": DataFrame, "video": mp4 bytes or None}, or None on failure.
+    Every source frame is written to the output video; frames that are skipped
+    for speed reuse the most recent boxes so the result plays back smoothly.
+    """
     tracker.reset()
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         tmp.write(video_file.read())
         video_path = tmp.name
+    out_path = video_path + ".out.mp4"
+    writer = None
 
     try:
         cap = cv2.VideoCapture(video_path)
@@ -238,90 +265,143 @@ def process_video(tracker, video_file, stride):
             return None
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-        st.info(f"📊 Frames: {total_frames} | FPS: {fps:.1f} | Processing every {stride} frame(s)")
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        if not fps or fps <= 0:
+            fps = 30
+        st.info(f"📊 Frames: {total_frames} | FPS: {fps:.1f} | Analysing every {stride} frame(s)")
 
         progress_bar = st.progress(0.0)
         status_text = st.empty()
         placeholder = st.empty()
 
+        players = {}
         frame_no = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             frame_no += 1
-            if (frame_no - 1) % stride:
-                continue
 
             h, w = frame.shape[:2]
-            if w > MAX_WIDTH:
-                frame = cv2.resize(frame, (MAX_WIDTH, int(h * MAX_WIDTH / w)))
+            if w > max_width:
+                frame = cv2.resize(frame, (max_width, int(h * max_width / w)))
+            h, w = frame.shape[:2]
+            frame = frame[:h - h % 2, :w - w % 2]    # H.264 needs even dimensions
 
-            annotated, players = tracker.process_frame(frame)
-            placeholder.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), width="stretch")
-
-            if total_frames > 0:
-                progress = min(frame_no / total_frames, 1.0)
-                progress_bar.progress(progress)
-                status_text.text(f"Frame {frame_no}/{total_frames} | Players on screen: {len(players)}")
+            if (frame_no - 1) % stride == 0:
+                annotated, players = tracker.process_frame(frame)
+                if show_preview:
+                    placeholder.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), width="stretch")
             else:
-                status_text.text(f"Frame {frame_no} | Players on screen: {len(players)}")
+                annotated = draw_players(frame, players)
+
+            if writer is None and frame_no == 1:
+                writer = open_video_writer(out_path, fps)
+            if writer is not None:
+                writer.append_data(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+
+            if frame_no % 5 == 0 or frame_no == total_frames:
+                if total_frames > 0:
+                    progress_bar.progress(min(frame_no / total_frames, 1.0))
+                    status_text.text(f"Frame {frame_no}/{total_frames} | Players on screen: {len(players)}")
+                else:
+                    status_text.text(f"Frame {frame_no} | Players on screen: {len(players)}")
 
         cap.release()
+        if writer is not None:
+            writer.close()
+            writer = None
+
         progress_bar.progress(1.0)
-        status_text.text(f"Done. Processed {tracker.frames_processed} frames.")
-        return tracker.get_stats()
+        status_text.text(f"Done. Analysed {tracker.frames_processed} of {frame_no} frames.")
+
+        video_bytes = None
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            with open(out_path, "rb") as f:
+                video_bytes = f.read()
+
+        return {"stats": tracker.get_stats(), "video": video_bytes}
 
     except Exception as e:
         st.error(f"❌ Processing error: {e}")
         return None
 
     finally:
-        try:
-            os.unlink(video_path)
-        except OSError:
-            pass
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:
+                pass
+        for path in (video_path, out_path):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
 
 
 # =====================================================
 # MAIN APP
 # =====================================================
 def main():
+    st.set_page_config(page_title="⚽ Player Tracker", layout="wide")
+
     st.title("⚽ Player Tracking System")
     st.write("Upload → Track → Analyze")
+    st.caption(f"Running on: {'GPU (CUDA)' if torch.cuda.is_available() else 'CPU - use the Nano model for speed'}")
 
-    try:
-        with st.spinner("Loading models (the first run downloads OCR weights)..."):
-            tracker = load_tracker()
-    except Exception as e:
-        st.error(f"❌ Failed to load models: {e}")
-        st.stop()
+    video_file = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv", "flv"])
 
-    for message in tracker.warnings:
-        st.warning(message)
-
-    col1, col2 = st.columns([3, 1])
-    with col1:
-        video_file = st.file_uploader(
-            "Upload video",
-            type=["mp4", "avi", "mov", "mkv", "flv"],
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        model_label = st.selectbox(
+            "Detection model", list(MODEL_CHOICES), index=0,
+            help="Nano is the fastest. Medium is the most accurate but slow on CPU.",
         )
-    with col2:
+    with c2:
+        max_width = st.selectbox(
+            "Max video width (px)", WIDTH_CHOICES, index=1,
+            help="Larger videos are scaled down to this width. Smaller is faster.",
+        )
+    with c3:
         stride = st.number_input(
-            "Process every N frames",
-            min_value=1, max_value=30, value=3, step=1,
-            help="Higher is faster but less precise. 1 processes every frame.",
+            "Analyse every N frames", min_value=1, max_value=30, value=3, step=1,
+            help="1 analyses every frame (slowest, most precise). Skipped frames reuse the latest boxes.",
         )
-        process_btn = st.button("Process", width="stretch")
+    with c4:
+        show_preview = st.checkbox(
+            "Show live preview", value=False,
+            help="Shows frames while processing. This slows processing down; the finished video plays smoothly.",
+        )
+
+    process_btn = st.button("Process", type="primary", disabled=video_file is None)
 
     if video_file is not None and process_btn:
-        st.session_state["stats"] = process_video(tracker, video_file, int(stride))
+        try:
+            with st.spinner("Loading models (the first use of a model downloads it)..."):
+                model = load_yolo(MODEL_CHOICES[model_label])
+                ocr, ocr_warning = load_ocr()
+        except Exception as e:
+            st.error(f"❌ Failed to load models: {e}")
+            st.stop()
+
+        if ocr_warning:
+            st.warning(ocr_warning)
+
+        tracker = PlayerTracker(model, ocr)
+        st.session_state["result"] = process_video(
+            tracker, video_file, int(stride), int(max_width), show_preview
+        )
 
     # Results live in session state so that clicking Download does not wipe them
-    stats_df = st.session_state.get("stats")
-    if stats_df is not None:
+    result = st.session_state.get("result")
+    if result is not None:
+        if result["video"]:
+            st.subheader("🎬 Annotated Video")
+            st.video(result["video"])
+            st.download_button("📥 Download video", result["video"], "tracked_players.mp4", "video/mp4")
+
         st.subheader("📊 Player Statistics")
+        stats_df = result["stats"]
         if stats_df.empty:
             st.warning("⚠️ No players detected in video")
         else:
