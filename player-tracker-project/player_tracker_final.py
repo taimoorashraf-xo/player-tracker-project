@@ -12,6 +12,7 @@ import torch
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics import YOLO
 
+import demo_data
 import scouting
 import video_metrics as vm
 
@@ -651,6 +652,31 @@ def render_video_tab():
         render_results(analysis, style)
 
 
+def resolve_identity(analysis, cands, tags, demo):
+    """Add name, position and shirt number to each candidate.
+
+    Priority: what the user typed, then simulated demo values (only in demo mode), then
+    whatever was measured (the OCR shirt number) or blank. 'id_source' says which was used.
+    """
+    seed = str(len(analysis["src"]))
+    out = cands.copy()
+    names, positions, shirts, sources, pass_pct, prog = [], [], [], [], [], []
+    for _, row in cands.iterrows():
+        sim = demo_data.simulate_player(seed + row["key"]) if demo else {}
+        tag = tags.get(row["key"], {})
+        names.append(tag.get("name", sim.get("name", "")))
+        positions.append(tag.get("position", sim.get("position", "")))
+        shirts.append(tag.get("shirt", row["shirt"] or sim.get("shirt", "")))
+        used = {f for f in ("name", "position", "shirt") if f in tag}
+        sources.append("user" if used else ("demo" if demo else ""))
+        pass_pct.append(sim.get("pass_pct", np.nan))
+        prog.append(sim.get("prog_passes", np.nan))
+    out["name"], out["position"], out["shirt_eff"] = names, positions, shirts
+    out["id_source"] = sources
+    out["pass_pct_demo"], out["prog_passes_demo"] = pass_pct, prog
+    return out
+
+
 def swatch_html(name, hex_color):
     box = (f"<span style='display:inline-block;width:14px;height:14px;border-radius:3px;"
            f"background:{hex_color};border:1px solid #888;vertical-align:middle'></span>")
@@ -671,9 +697,51 @@ def render_results(analysis, style):
     teams = st.multiselect(
         "Scout players from", present, default=[t for t in present if t != "Other"],
         help="'Other' is usually the referee, goalkeepers or players whose kit colour was unclear.")
-    pool = cands[cands["team"].isin(teams)]
+
+    # ---------- names and positions (typed by you, or simulated in demo mode) ----------
+    demo = st.checkbox(
+        "Demo mode: fill in names, positions and passing figures with simulated data", key="demo_mode",
+        help="Highlights alone cannot tell us who a player is or how they pass. Demo mode adds clearly "
+             "labelled placeholders so the full flow can be shown. They never change the fit score.")
+    if demo:
+        st.warning("Demo mode is on: names, positions, shirt numbers and passing figures are SIMULATED "
+                   "placeholders, not measured. Say so when you present the results.")
+    tags = st.session_state.setdefault("tags", {})
+    defaults = resolve_identity(analysis, cands, {}, demo)
+    current = resolve_identity(analysis, cands, tags, demo)
+    with st.expander("Edit names, positions and shirt numbers (your own input)"):
+        editor = pd.DataFrame({"Player": current["player"], "Name": current["name"],
+                               "Position": current["position"], "Shirt #": current["shirt_eff"]})
+        edited = st.data_editor(
+            editor, key=f"tag_editor_{demo}", hide_index=True, width="stretch", disabled=["Player"],
+            column_config={"Position": st.column_config.SelectboxColumn(
+                options=[""] + demo_data.POSITIONS)})
+        for i in range(len(edited)):
+            key = cands.iloc[i]["key"]
+            for field, column in (("name", "Name"), ("position", "Position"), ("shirt", "Shirt #")):
+                typed = edited.iloc[i][column] or ""
+                shown_default = defaults.iloc[i]["shirt_eff" if field == "shirt" else field]
+                if typed != shown_default:
+                    tags.setdefault(key, {})[field] = typed
+                elif key in tags:
+                    tags[key].pop(field, None)
+        current = resolve_identity(analysis, cands, tags, demo)
+
+    labelled = current.copy()
+    for column in ("name", "position"):
+        labelled[column] = [
+            (f"{v} (demo)" if v and src == "demo" else v)
+            for v, src in zip(current[column], current["id_source"])]
+    pool = labelled[labelled["team"].isin(teams)]
+    present_positions = sorted({p for p in current.loc[pool.index, "position"] if p})
+    wanted = "Any"
+    if present_positions:
+        wanted = st.selectbox("Position needed", ["Any"] + present_positions,
+                              help="Only players tagged with this position are ranked.")
+    if wanted != "Any":
+        pool = pool[current.loc[pool.index, "position"] == wanted]
     if pool.empty:
-        st.info("Select at least one team.")
+        st.info("No players match the selected teams and position.")
         return
 
     base = vm.VIDEO_STYLES[style]
@@ -694,16 +762,24 @@ def render_results(analysis, style):
         st.warning(f"Only {len(table)} players are being compared, so the percentiles are rough.")
 
     st.markdown(f"### Best fits for: {style.lower()}")
-    top_n = st.slider("Highlight the top N players in the video", 1, min(10, len(table)), min(3, len(table)))
-    shown = table.assign(rank=range(1, len(table) + 1))[[
-        "rank", "photo", "player", "team", "shirt", "observed_s", "avg_speed_kmh", "top_speed_kmh",
-        "distance_m", "hi_share", "press_share", "fit_score"]]
+    if len(table) > 1:
+        top_n = st.slider("Highlight the top N players in the video", 1, min(10, len(table)), min(3, len(table)))
+    else:
+        top_n = 1
+    columns = ["rank", "photo", "player", "name", "position", "team", "shirt_eff", "observed_s",
+               "avg_speed_kmh", "top_speed_kmh", "distance_m", "hi_share", "press_share", "fit_score"]
+    if demo:
+        columns += ["pass_pct_demo", "prog_passes_demo"]
+    shown = table.assign(rank=range(1, len(table) + 1))[columns]
     st.dataframe(
         shown, width="stretch", hide_index=True, row_height=64,
         column_config={
             "rank": st.column_config.NumberColumn("Rank", width="small"),
             "photo": st.column_config.ImageColumn("Photo", width="small"),
-            "player": "Player", "team": "Team", "shirt": "Shirt #",
+            "player": "Player", "name": "Name", "position": "Position", "team": "Team",
+            "shirt_eff": "Shirt #",
+            "pass_pct_demo": st.column_config.NumberColumn("Pass completion % (demo)", format="%.0f"),
+            "prog_passes_demo": st.column_config.NumberColumn("Progressive passes/90 (demo)", format="%.1f"),
             "observed_s": st.column_config.NumberColumn("Measured (s)", format="%.1f"),
             "avg_speed_kmh": st.column_config.NumberColumn("Avg speed (km/h)", format="%.1f"),
             "top_speed_kmh": st.column_config.NumberColumn("Top speed (km/h)", format="%.1f"),
@@ -712,8 +788,10 @@ def render_results(analysis, style):
             "press_share": st.column_config.NumberColumn("Pressing (%)", format="%.0f"),
             "fit_score": st.column_config.ProgressColumn("Fit score", min_value=0, max_value=100, format="%.0f"),
         })
-    export = shown.drop(columns=["photo"]).rename(columns={
-        "rank": "Rank", "player": "Player", "team": "Team", "shirt": "Shirt", "observed_s": "Measured_s",
+    export = shown.drop(columns=["photo"]).assign(identity_source=table["id_source"].replace("", "measured/none")).rename(columns={
+        "rank": "Rank", "player": "Player", "name": "Name", "position": "Position", "team": "Team",
+        "shirt_eff": "Shirt", "pass_pct_demo": "Pass_pct_DEMO", "prog_passes_demo": "Prog_passes_DEMO",
+        "observed_s": "Measured_s",
         "avg_speed_kmh": "Avg_speed_kmh", "top_speed_kmh": "Top_speed_kmh", "distance_m": "Distance_m",
         "hi_share": "High_intensity_pct", "press_share": "Pressing_pct", "fit_score": "Fit_score"})
     st.download_button("📥 Download ranking (CSV)", export.to_csv(index=False), "video_ranking.csv", "text/csv")
@@ -738,7 +816,8 @@ def render_results(analysis, style):
 
     # ---------- player report ----------
     st.markdown("### Player report")
-    labels = {f"{i + 1}. {table.loc[i, 'player']} ({table.loc[i, 'team']})": i for i in range(len(table))}
+    labels = {f"{i + 1}. {table.loc[i, 'name'] or table.loc[i, 'player']} ({table.loc[i, 'team']})": i
+              for i in range(len(table))}
     chosen = st.selectbox("Player", list(labels))
     i = labels[chosen]
     row = table.loc[i]
@@ -747,7 +826,12 @@ def render_results(analysis, style):
         if row["key"] in analysis["thumbs"]:
             st.image(analysis["thumbs"][row["key"]], width=120)
     with right:
-        st.markdown(f"**{row['player']}** ({row['team']}): fit score **{row['fit_score']}** out of 100")
+        who = row["name"] or row["player"]
+        extra = f", {row['position']}" if row["position"] else ""
+        st.markdown(f"**{who}** ({row['team']}{extra}): fit score **{row['fit_score']}** out of 100")
+        if row["id_source"] == "demo":
+            st.caption("Name and position are simulated placeholders (demo mode). The fit score uses only "
+                       "what was measured from the video.")
         st.write(vm.explain_video(row, pct.loc[i], weights))
         st.caption("Percentiles compare this player with the other players in this video only.")
     detail = pd.DataFrame({

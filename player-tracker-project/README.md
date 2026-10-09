@@ -24,6 +24,13 @@ This is a **prototype** that demonstrates what video analysis can do for scoutin
 - Shirt numbers are only readable in close-ups.
 - Percentiles compare players **within the same video** only.
 
+### Names, positions and demo mode
+
+Highlights alone cannot tell the app who a player is, or what position they play. Two options fill that gap:
+
+- **Your own input:** open "Edit names, positions and shirt numbers" and type them in. The **Position needed** filter then ranks only players tagged with that position (for example a right winger).
+- **Demo mode:** one checkbox fills in simulated names, positions, shirt numbers and passing figures, so the whole flow can be shown on any clip. Everything simulated is labelled **(demo)**, appears in separate demo columns, is marked in the CSV, and **never changes the fit score**. If you present results from demo mode, say that those details are placeholders.
+
 ## Data scouting tab
 
 A second tab ranks players using real match event data instead of video. Pick a position and a playing style (high press, possession build-up, counter-attack or balanced), and the app scores every player in the data against it and explains the fit.
@@ -83,7 +90,7 @@ Browser opens at: `http://localhost:8501`
 1. Open the **🎥 Analyse a video** tab and upload a highlights video (MP4, AVI, MOV, MKV).
 2. Choose **What kind of player do you need?**
 3. Click **Analyse video** and wait for the progress bar to finish.
-4. Read the ranked table, choose which teams to scout, and open a **Player report**.
+4. Read the ranked table, choose which teams to scout, optionally tag names and positions (or switch on demo mode), and open a **Player report**.
 5. Set **Highlight the top N players** and watch the highlighted video. If you change the settings afterwards, click **Update highlighted video**.
 
 #### Advanced settings
@@ -138,6 +145,7 @@ player-tracker-project/
 ├── player_tracker_final.py    (Main app: both tabs, detection and tracking)
 ├── video_metrics.py            (Speed, pressing, team grouping and ranking from video)
 ├── scouting.py                 (Data scouting metrics and fit scoring)
+├── demo_data.py                (Clearly labelled simulated placeholders for demos)
 ├── yolov8m.pt                  (YOLOv8 medium weights; nano/small download on first use)
 ├── data_cache/                 (Downloaded match data; created automatically)
 ├── requirements.txt            (Dependencies)
