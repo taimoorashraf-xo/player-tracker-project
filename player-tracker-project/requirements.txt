@@ -11,3 +11,4 @@ scipy>=1.11.0
 Pillow>=10.0.0
 imageio>=2.31
 imageio-ffmpeg>=0.4.9  # H.264 encoder for the annotated output video
+statsbombpy>=1.13  # free StatsBomb open data for the Scouting tab

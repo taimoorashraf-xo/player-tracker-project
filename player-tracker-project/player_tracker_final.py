@@ -11,6 +11,8 @@ import torch
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics import YOLO
 
+import scouting
+
 # =====================================================
 # SETTINGS
 # =====================================================
@@ -443,14 +445,15 @@ def process_video(tracker, video_file, stride, max_width, show_preview):
 
 
 # =====================================================
-# MAIN APP
+# VIDEO TAB
 # =====================================================
-def main():
-    st.set_page_config(page_title="⚽ Player Tracker", layout="wide")
-
-    st.title("⚽ Player Tracking System")
-    st.write("Upload → Track → Analyze")
+def render_video_tab():
     st.caption(f"Running on: {'GPU (CUDA)' if torch.cuda.is_available() else 'CPU - use the Nano model for speed'}")
+    st.info(
+        "This tab tracks players in video you upload and shows who is on screen. It works best on a "
+        "fixed or slowly moving camera. It cannot measure speed, distance or passing from edited "
+        "highlights; use the Scouting tab for those."
+    )
 
     video_file = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv", "flv"])
 
@@ -522,6 +525,143 @@ def main():
                 "player_stats.csv",
                 "text/csv",
             )
+
+
+# =====================================================
+# SCOUTING TAB
+# =====================================================
+DATA_CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
+
+
+@st.cache_data(show_spinner=False, ttl=24 * 3600)
+def get_competitions():
+    return scouting.list_competitions()
+
+
+def render_scouting_tab():
+    st.write(
+        "Describe the position and the way your team plays. The app scores every player in the "
+        "dataset against that description and explains the fit. All numbers come from real match "
+        "event data (free StatsBomb Open Data), not from video."
+    )
+    with st.expander("What this can and can't tell you"):
+        st.markdown(
+            "- **Passing, pressing, carrying and shooting** are counted from real match events.\n"
+            "- **Work rate and pace are proxies.** Event data has no distance run or sprint speed, so "
+            "work rate uses pressures, recoveries and counter-presses, and pace uses progressive carries, "
+            "carry distance and dribbles.\n"
+            "- Players are compared **only with others in the same position group**, as percentiles.\n"
+            "- The free data covers selected competitions only, and a few matches means a small sample. "
+            "Use the result to build a shortlist to watch, not as a final verdict."
+        )
+
+    # ---------- 1. data ----------
+    try:
+        comps = get_competitions()
+    except Exception as e:
+        st.error(f"Could not load the competition list. An internet connection is needed. ({e})")
+        return
+
+    labels = comps["label"].tolist()
+    chosen = st.multiselect(
+        "Competitions to analyse", labels,
+        default=[l for l in labels if l == "UEFA Euro 2024"],
+        help="Choosing several gives bigger player pools. The first load downloads match data "
+             "(about a second per match) and is then cached on your computer.",
+    )
+    max_matches = st.number_input("Limit number of matches (0 = all)", 0, 1000, 0, step=1)
+
+    if st.button("Load player data", disabled=not chosen):
+        picked = comps[comps["label"].isin(chosen)]
+        selections = list(zip(picked["competition_id"], picked["season_id"]))
+        bar = st.progress(0.0, text="Starting...")
+        try:
+            profiles, skipped = scouting.build_dataset(
+                selections, DATA_CACHE_DIR, int(max_matches) or None,
+                progress=lambda i, n: bar.progress(i / n, text=f"Match {i} of {n}"),
+            )
+            st.session_state["profiles"] = profiles
+            st.session_state["skipped"] = skipped
+        except Exception as e:
+            st.error(f"Could not download match data: {e}")
+        bar.empty()
+
+    profiles = st.session_state.get("profiles")
+    if profiles is None:
+        st.info("Choose competitions and click **Load player data** to begin.")
+        return
+    if profiles.empty:
+        st.warning("No player data was loaded.")
+        return
+    note = f" ({st.session_state['skipped']} matches could not be read)" if st.session_state.get("skipped") else ""
+    st.success(f"Loaded {len(profiles)} players{note}.")
+
+    # ---------- 2. requirements ----------
+    st.markdown("### Your requirements")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        group = st.selectbox("Position you are recruiting for", scouting.POSITION_GROUPS, index=5)
+    with c2:
+        style = st.selectbox("How does your team play?", list(scouting.STYLE_WEIGHTS))
+    with c3:
+        min_minutes = st.slider("Minimum minutes played", 0, 900, 180, step=30)
+
+    base = scouting.default_weights(group, style)
+    metric_keys = list(scouting.RATE_METRICS) + list(scouting.OTHER_METRICS)
+    weights = {}
+    with st.expander("Fine-tune what matters (-1 = lower is better, 0 = ignore, 1 = very important)"):
+        cols = st.columns(2)
+        for i, metric in enumerate(metric_keys):
+            with cols[i % 2]:
+                weights[metric] = st.slider(
+                    scouting.METRIC_LABELS[metric], -1.0, 1.0, float(base.get(metric, 0.0)), 0.1,
+                    key=f"w_{group}_{style}_{metric}", help=scouting.METRIC_HELP[metric],
+                )
+
+    # ---------- 3. results ----------
+    table, pct, raw = scouting.fit_scores(profiles, group, weights, min_minutes)
+    if table.empty:
+        st.warning("No players match these filters. Lower the minimum minutes or load more matches.")
+        return
+    if len(table) < 8:
+        st.warning(f"Only {len(table)} players are in this comparison group, so percentiles are rough.")
+
+    st.markdown(f"### Best fits: {group.lower()}s for a {style.lower()} team")
+    top_n = st.slider("Players to show", 5, 50, min(15, len(table)))
+    shown = table.head(top_n).rename(columns={
+        "player": "Player", "team": "Team", "position": "Position",
+        "minutes": "Minutes", "fit_score": "Fit score (0-100)"})
+    st.dataframe(shown, width="stretch", hide_index=True)
+    st.download_button("📥 Download shortlist (CSV)", shown.to_csv(index=False), "shortlist.csv", "text/csv")
+
+    st.markdown("### Player report")
+    name = st.selectbox("Player", shown["Player"].tolist())
+    i = int(table.index[table["player"] == name][0])
+    st.markdown(f"**{name}** ({table.loc[i, 'team']}): fit score **{table.loc[i, 'fit_score']}** out of 100")
+    st.write(scouting.explain(table.loc[i], pct.loc[i], weights))
+
+    detail = pd.DataFrame({
+        "Metric": [scouting.METRIC_LABELS[m] for m in pct.columns],
+        "Importance": [weights[m] for m in pct.columns],
+        "Percentile (100 = best among peers)": pct.loc[i].round(0).astype(int).to_numpy(),
+        "Value": raw.loc[i].round(2).to_numpy(),
+    })
+    st.bar_chart(detail.set_index("Metric")["Percentile (100 = best among peers)"])
+    st.dataframe(detail, width="stretch", hide_index=True)
+
+
+# =====================================================
+# MAIN APP
+# =====================================================
+def main():
+    st.set_page_config(page_title="⚽ Player Scouting", layout="wide")
+    st.title("⚽ Player Scouting & Tracking")
+
+    scouting_tab, video_tab = st.tabs(["🔎 Scouting", "🎥 Video tracker"])
+    with scouting_tab:
+        render_scouting_tab()
+    with video_tab:
+        render_video_tab()
 
 
 if __name__ == "__main__":

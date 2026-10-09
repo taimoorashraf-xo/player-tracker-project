@@ -1,17 +1,33 @@
-# ⚽ Player Tracking System
+# ⚽ Player Scouting & Tracking
 
-Real-time player detection, tracking, and analysis from video files.
+Two tools in one app:
 
-## Features
+- **🔎 Scouting** - Find players who fit your position and playing style, using real match data.
+- **🎥 Video tracker** - Detect and follow players in a video you upload.
 
-✅ **Real-time Detection** - YOLOv8 person detection  
-✅ **Persistent Tracking** - Deep SORT multi-object tracking  
-✅ **Shirt Number OCR** - Automatic shirt number extraction  
-✅ **Team Detection** - Color-based team classification  
+## Scouting tab
+
+Pick the position you are recruiting for and how your team plays (high press, possession build-up, counter-attack or balanced). The app scores every player in the data against those requirements, ranks them, and explains each player's fit in plain words.
+
+- **Data:** free [StatsBomb Open Data](https://github.com/statsbomb/open-data) (selected men's competitions, including UEFA Euro 2020 and 2024). It downloads on first use (about a second per match) and is cached in `data_cache/`. Needs an internet connection the first time.
+- **Metrics (per 90 minutes):** passing (volume, completion, progressive, key, into the final third, long, crosses), pressing and defending (pressures, counter-presses, recoveries, interceptions, tackles), ball carrying (carries, progressive carries, carry distance, dribbles), shooting (shots, xG, goals), ball losses and average position.
+- **Scoring:** each metric becomes a percentile among players in the same position group, and the fit score (0-100) is the weighted average using weights for the position and style. You can change every weight in "Fine-tune what matters".
+- **Honest limits:** event data has no distance run or sprint speed, so **work rate and pace are proxies** (pressures and recoveries; progressive carries and dribbles). A few matches means a small sample. Treat the result as a shortlist to watch, not a verdict.
+
+Edited highlights from YouTube cannot give reliable speed, work rate or passing numbers, which is why the scouting numbers come from event data instead of video.
+
+## Video tracker tab
+
+✅ **Detection** - YOLOv8 person detection, limited to people on the pitch  
+✅ **Tracking** - Deep SORT with camera-pan compensation and shirt-colour appearance features  
+✅ **Shirt Number OCR** - Reads numbers on a sample of frames  
+✅ **Team Detection** - Kit colour, ignoring grass  
 ✅ **Annotated Video** - Smooth playback of the result, with a download button  
 ✅ **Live Preview (optional)** - Watch frames while processing  
-✅ **Statistics** - Frame counts, detection rates, CSV export  
+✅ **Statistics** - Time on screen per player, CSV export  
 ✅ **Speed controls** - Choose the model size, video width and how many frames to analyse  
+
+It identifies who is on screen and for how long. It does not measure speed, distance or passing.
 
 ## Requirements
 
@@ -55,6 +71,14 @@ streamlit run player_tracker_final.py
 Browser opens at: `http://localhost:8501`
 
 ## Usage
+
+### Scouting
+
+1. Open the **Scouting** tab, choose competitions and click **Load player data**.
+2. Choose the position, the way your team plays, and a minimum number of minutes.
+3. Read the ranked shortlist and pick a player for the fit report. Download the shortlist as CSV.
+
+### Video tracker
 
 1. **Upload Video** - MP4/AVI/MOV/MKV format
 2. **Pick settings** - See "Speed settings" below
@@ -124,7 +148,9 @@ streamlit run player_tracker_final.py --server.port 8502
 
 ```
 player-tracker-project/
-├── player_tracker_final.py    (Main app)
+├── player_tracker_final.py    (Main app: Scouting and Video tracker tabs)
+├── scouting.py                 (Scouting metrics and fit scoring)
+├── data_cache/                 (Downloaded match data; created automatically)
 ├── yolov8m.pt                  (YOLOv8 medium weights; nano/small download on first use)
 ├── requirements.txt            (Dependencies)
 ├── README.md                   (This file)
