@@ -1,0 +1,135 @@
+================================================================================
+    ⚽ PLAYER TRACKER - QUICK START (5 MINUTES)
+================================================================================
+
+WHAT YOU NEED:
+  - Python 3.9+ (download from python.org if needed)
+  - 2GB free disk space
+
+================================================================================
+    WINDOWS USERS - EASIEST METHOD
+================================================================================
+
+1. Extract this ZIP file to a folder
+
+2. Open Command Prompt (Win+R → type cmd → Enter)
+
+3. Navigate to folder:
+   cd path\to\player-tracker-project
+
+4. Run setup (automated):
+   python setup.py
+
+5. After setup completes, run:
+   run.bat
+
+   OR manually:
+   python player_tracker_final.py
+
+Browser opens at: http://localhost:8501
+
+================================================================================
+    MAC/LINUX USERS
+================================================================================
+
+1. Extract this ZIP file to a folder
+
+2. Open Terminal
+
+3. Navigate to folder:
+   cd path/to/player-tracker-project
+
+4. Make script executable:
+   chmod +x run.sh
+
+5. Run automated setup:
+   python3 setup.py
+
+6. Run app:
+   ./run.sh
+
+   OR manually:
+   python3 player_tracker_final.py
+
+Browser opens at: http://localhost:8501
+
+================================================================================
+    MANUAL SETUP (IF AUTO DOESN'T WORK)
+================================================================================
+
+Windows:
+  python -m venv venv
+  venv\Scripts\activate
+  pip install -r requirements.txt
+  streamlit run player_tracker_final.py
+
+Mac/Linux:
+  python3 -m venv venv
+  source venv/bin/activate
+  pip install -r requirements.txt
+  streamlit run player_tracker_final.py
+
+================================================================================
+    VERIFY SETUP WORKS
+================================================================================
+
+Run this to check all dependencies:
+  python check_setup.py
+
+Should show all ✅ marks if ready.
+
+================================================================================
+    TROUBLESHOOTING
+================================================================================
+
+PORT 8501 IN USE:
+  streamlit run player_tracker_final.py --server.port 8502
+
+FIRST RUN SLOW:
+  Normal! Models download on first run (~5-10 min). Subsequent runs faster.
+
+MODULE ERRORS:
+  pip install --upgrade pip
+  pip install -r requirements.txt --no-cache-dir
+
+NO PLAYERS DETECTED:
+  Try different video with better visibility. Check that people are clearly 
+  visible in the frame.
+
+OCR NOT READING NUMBERS:
+  Shirt numbers need to be clear and straight-on. Lighting affects accuracy.
+
+================================================================================
+    SUPPORT FILES
+================================================================================
+
+README.md        - Overview and features
+SETUP_GUIDE.md   - Detailed troubleshooting
+check_setup.py   - Verify dependencies installed
+setup.py         - Automated setup script
+run.bat          - Windows quick run
+run.sh           - Mac/Linux quick run
+
+================================================================================
+    FILES INCLUDED
+================================================================================
+
+player_tracker_final.py  - Main application
+requirements.txt         - Python dependencies
+README.md               - Project overview
+SETUP_GUIDE.md          - Complete setup guide
+check_setup.py          - Dependency checker
+setup.py                - Auto installer
+run.bat                 - Windows launcher
+run.sh                  - Mac/Linux launcher
+.gitignore              - Git ignore rules
+
+================================================================================
+
+Ready? Extract ZIP → Follow instructions above → Upload video → Process!
+
+Questions? Check SETUP_GUIDE.md
+
+Good luck! ⚽
+
+================================================================================
