@@ -1,3 +1,4 @@
+import base64
 import os
 import tempfile
 from collections import Counter, defaultdict
@@ -12,6 +13,7 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from ultralytics import YOLO
 
 import scouting
+import video_metrics as vm
 
 # =====================================================
 # SETTINGS
@@ -28,7 +30,6 @@ WIDTH_CHOICES = [480, 640, 960, 1280]   # frames wider than this are scaled down
 
 PERSON_CONF = 0.4           # YOLO confidence threshold for "person"
 MIN_BOX_HEIGHT_FRAC = 0.04  # ignore detections shorter than 4% of the frame height
-MIN_TRACK_FRAMES = 5        # tracks seen in fewer analysed frames are dropped from the stats
 OCR_EVERY_N_FRAMES = 10     # try reading a shirt number on every Nth frame per track
 OCR_MAX_ATTEMPTS = 10       # give up on a track after this many OCR attempts
 OCR_MIN_CONF = 0.3
@@ -41,7 +42,10 @@ PITCH_MIN_GRASS = 0.3       # share of grass around a person's feet to count as 
 
 # Camera pan estimation
 CAMERA_ANALYSIS_WIDTH = 320
-CAMERA_MIN_RESPONSE = 0.05  # below this the frames are too different (a cut); ignore the shift
+CAMERA_MIN_RESPONSE = 0.05  # below this the pan estimate is unreliable and is ignored
+CUT_PHASE_RESPONSE = 0.03   # below this the two frames share almost no picture: a new camera shot
+CUT_SIMILARITY = 0.6        # colour-histogram similarity below this between frames also means a new shot
+THUMB_HEIGHT = 120          # height in pixels of each player's photo
 
 # Kit colours in HSV. Red wraps around, so it has two ranges. Green is left out on
 # purpose because grass would otherwise be read as a green team.
@@ -76,6 +80,12 @@ def _new_track_state():
         "teams": Counter(),
         "numbers": Counter(),
         "ocr_attempts": 0,
+        "cand": None,           # candidate number shown in the video (P1, P2, ...)
+        "obs": [],              # (time, foot x, foot y, box height, touches edge) in stabilised pixels
+        "thumb": None,          # best photo of the player
+        "thumb_h": 0,
+        "color_sum": np.zeros(3),   # running sum of average shirt colour (Lab) for team grouping
+        "color_n": 0,
     }
 
 
@@ -115,6 +125,13 @@ def appearance_embedding(shirt):
     return (hist / norm).astype(np.float32)
 
 
+def frame_signature(frame):
+    """Small colour histogram of a frame, used to notice when the broadcast cuts to a new shot."""
+    hsv = cv2.cvtColor(cv2.resize(frame, (64, 36)), cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [16, 8], [0, 180, 0, 256])
+    return cv2.normalize(hist, hist, 1, 0, cv2.NORM_L1).flatten()
+
+
 class CameraMotion:
     """Estimates how far a panning camera has moved, so players can be tracked in
     a stable coordinate system instead of jumping around with every pan."""
@@ -123,6 +140,7 @@ class CameraMotion:
         self.prev = None
         self.window = None
         self.offset = np.zeros(2)   # total shift of the picture content since the first frame
+        self.last_response = 1.0    # how well the last two frames matched (near 0 after a cut)
 
     def update(self, frame):
         h, w = frame.shape[:2]
@@ -134,8 +152,11 @@ class CameraMotion:
             if self.window is None or self.window.shape != gray.shape:
                 self.window = cv2.createHanningWindow((gray.shape[1], gray.shape[0]), cv2.CV_32F)
             (dx, dy), response = cv2.phaseCorrelate(self.prev, gray, self.window)
+            self.last_response = response
             if response >= CAMERA_MIN_RESPONSE:
                 self.offset += (dx / scale, dy / scale)
+        elif self.prev is not None:
+            self.last_response = 0.0
         self.prev = gray
         return self.offset
 
@@ -152,7 +173,7 @@ def draw_players(frame, players):
         color = TEAM_BOX_COLORS.get(info["team"], TEAM_BOX_COLORS["Unknown"])
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
 
-        label = str(track_id)
+        label = info.get("label", str(track_id))
         if info["shirt_number"] != "?":
             label += f" #{info['shirt_number']}"
         (text_w, text_h), _ = cv2.getTextSize(label, FONT, scale, 1)
@@ -185,6 +206,19 @@ class PlayerTracker:
         self.camera = CameraMotion()
         self.tracks = defaultdict(_new_track_state)
         self.frames_processed = 0
+        self.shot = 0               # increases whenever the broadcast cuts to a new camera shot
+        self.prev_signature = None
+        self.cand_count = 0
+        self.records = []           # per analysed frame: who was where (used for closeness and rendering)
+
+    def _start_new_shot(self, frame):
+        """A cut: old tracks cannot continue, so start tracking and pan estimation afresh."""
+        self.shot += 1
+        self.deepsort = DeepSort(
+            embedder=None, max_age=30, n_init=3, nn_budget=100, max_cosine_distance=0.3,
+        )
+        self.camera = CameraMotion()
+        self.camera.update(frame)
 
     def detect_team(self, shirt):
         """Return the dominant kit colour in the shirt area (ignoring grass), or 'Unknown'."""
@@ -244,14 +278,27 @@ class PlayerTracker:
             people.append(((x1, y1, x2, y2), float(conf)))
         return people
 
-    def process_frame(self, frame):
-        """Detect and track players in one frame. Returns (annotated_frame, players)."""
+    def process_frame(self, frame, t=0.0, frame_no=0, source=None):
+        """Detect and track players in one frame. Returns (annotated_frame, players).
+
+        t is the time in seconds, frame_no the source frame number, and source an optional
+        full-resolution version of the frame used for the player photos.
+        """
         self.frames_processed += 1
         frame_h, frame_w = frame.shape[:2]
+        photo_frame = frame if source is None else source
+        photo_scale = photo_frame.shape[1] / frame_w
 
-        # Track in camera-stabilised coordinates so a panning camera does not make
-        # every player look like they jumped.
+        # Notice cuts to a new camera shot, then track in camera-stabilised coordinates so
+        # a panning camera does not make every player look like they jumped.
+        signature = frame_signature(frame)
         off_x, off_y = self.camera.update(frame)
+        if self.prev_signature is not None:
+            similarity = cv2.compareHist(self.prev_signature, signature, cv2.HISTCMP_CORREL)
+            if similarity < CUT_SIMILARITY or self.camera.last_response < CUT_PHASE_RESPONSE:
+                self._start_new_shot(frame)
+                off_x = off_y = 0.0
+        self.prev_signature = signature
 
         detections, embeds = [], []
         for (x1, y1, x2, y2), conf in self._detect_people(frame):
@@ -267,16 +314,41 @@ class PlayerTracker:
             if not track.is_confirmed() or track.time_since_update > 0:
                 continue
 
-            track_id = track.track_id
-            l, t, r, b = track.to_ltrb()
-            x1, y1 = max(0, int(l + off_x)), max(0, int(t + off_y))
-            x2, y2 = min(frame_w, int(r + off_x)), min(frame_h, int(b + off_y))
+            key = f"S{self.shot}-{track.track_id}"
+            l, top, r, b = track.to_ltrb()
+            left, upper, right, lower = l + off_x, top + off_y, r + off_x, b + off_y
+            edge = left < 2 or upper < 2 or right > frame_w - 2 or lower > frame_h - 2
+            x1, y1 = max(0, int(left)), max(0, int(upper))
+            x2, y2 = min(frame_w, int(right)), min(frame_h, int(lower))
             if x2 <= x1 or y2 <= y1:
                 continue
 
             shirt = shirt_area(frame[y1:y2, x1:x2])
-            state = self.tracks[track_id]
+            state = self.tracks[key]
+            if state["cand"] is None:
+                self.cand_count += 1
+                state["cand"] = self.cand_count
             state["frames"] += 1
+            state["obs"].append((t, (x1 + x2) / 2 - off_x, y2 - off_y, y2 - y1, edge))
+
+            # Average shirt colour (grass excluded), used later to group players into teams
+            if shirt is not None:
+                not_grass = grass_mask(cv2.cvtColor(shirt, cv2.COLOR_BGR2HSV)) == 0
+                if not_grass.mean() >= 0.3:
+                    lab = cv2.cvtColor(shirt, cv2.COLOR_BGR2LAB)
+                    state["color_sum"] += lab[not_grass].mean(axis=0)
+                    state["color_n"] += 1
+
+            # Keep the sharpest-looking photo: the largest box that is fully in frame
+            if not edge and (y2 - y1) > state["thumb_h"]:
+                px1, py1 = int(x1 * photo_scale), int(y1 * photo_scale)
+                px2, py2 = int(x2 * photo_scale), int(y2 * photo_scale)
+                crop = photo_frame[py1:py2, px1:px2]
+                if crop.size:
+                    ratio = THUMB_HEIGHT / crop.shape[0]
+                    state["thumb"] = cv2.resize(crop, None, fx=ratio, fy=ratio, interpolation=cv2.INTER_AREA
+                                                if ratio < 1 else cv2.INTER_CUBIC)
+                    state["thumb_h"] = y2 - y1
 
             team = self.detect_team(shirt)
             if team != "Unknown":
@@ -290,31 +362,18 @@ class PlayerTracker:
                 if number:
                     state["numbers"][number] += 1
 
-            players[track_id] = {
+            players[key] = {
                 "bbox": (x1, y1, x2, y2),
+                "label": f"P{state['cand']}",
                 "team": _majority(state["teams"]) or "Unknown",
                 "shirt_number": _majority(state["numbers"]) or "?",
+                "pos": ((x1 + x2) / 2 - off_x, y2 - off_y),
+                "h": y2 - y1,
+                "edge": edge,
             }
 
+        self.records.append({"t": t, "frame_no": frame_no, "players": players})
         return draw_players(frame, players), players
-
-    def get_stats(self, seconds_per_frame):
-        """One row per tracked player (brief, noisy tracks are dropped), longest first."""
-        rows = []
-        for track_id, state in self.tracks.items():
-            if state["frames"] < MIN_TRACK_FRAMES:
-                continue
-            rows.append({
-                "Player ID": track_id,
-                "Shirt Number": _majority(state["numbers"]) or "N/A",
-                "Team": _majority(state["teams"]) or "Unknown",
-                "Time on screen (s)": round(state["frames"] * seconds_per_frame, 1),
-                "Frames Analysed": state["frames"],
-            })
-
-        if not rows:
-            return pd.DataFrame()
-        return pd.DataFrame(rows).sort_values("Time on screen (s)", ascending=False)
 
 
 # =====================================================
@@ -336,32 +395,70 @@ def load_ocr():
 
 
 # =====================================================
-# VIDEO PROCESSING
+# VIDEO ANALYSIS
 # =====================================================
+HIGHLIGHT_COLOR = (0, 200, 255)     # BGR gold for the best-fit players
+
+
+def fit_frame(frame, max_width):
+    """Scale a frame down to max_width and trim to even dimensions (H.264 needs them)."""
+    h, w = frame.shape[:2]
+    if w > max_width:
+        frame = cv2.resize(frame, (max_width, int(h * max_width / w)))
+        h, w = frame.shape[:2]
+    return frame[:h - h % 2, :w - w % 2]
+
+
 def open_video_writer(path, fps):
     """H.264 writer that browsers can play. Returns None if the encoder is unavailable."""
     try:
         import imageio
         return imageio.get_writer(path, fps=fps, codec="libx264", macro_block_size=1)
     except Exception as e:
-        st.warning(f"Could not create the output video ({e}). Statistics will still be produced.")
+        st.warning(f"Could not create the output video ({e}).")
         return None
 
 
-def process_video(tracker, video_file, stride, max_width, show_preview):
-    """Run the tracker over an uploaded video.
+def to_data_uri(image):
+    ok, buf = cv2.imencode(".png", image)
+    return "data:image/png;base64," + base64.b64encode(buf.tobytes()).decode() if ok else None
 
-    Returns {"stats": DataFrame, "video": mp4 bytes or None}, or None on failure.
-    Every source frame is written to the output video; frames that are skipped
-    for speed reuse the most recent boxes so the result plays back smoothly.
-    """
+
+def build_candidates(tracker):
+    """Measurements, team and photo for every player who was visible long enough."""
+    colors = {k: (st_["color_sum"] / st_["color_n"], st_["color_n"])
+              for k, st_ in tracker.tracks.items() if st_["color_n"] >= 3}
+    team_of, swatches = vm.cluster_teams(colors)
+    contact = vm.contact_metrics(tracker.records, {k: t for k, t in team_of.items() if t != "Other"})
+
+    rows, thumbs = [], {}
+    for key, state in tracker.tracks.items():
+        metrics = vm.track_metrics(state["obs"])
+        if metrics is None or key not in team_of:
+            continue
+        extra = contact.get(key, {})
+        if state["thumb"] is not None:
+            thumbs[key] = cv2.imencode(".png", state["thumb"])[1].tobytes()
+        rows.append({
+            "key": key,
+            "player": f"P{state['cand']}",
+            "team": team_of[key],
+            "shirt": _majority(state["numbers"]) or "",
+            "photo": to_data_uri(state["thumb"]) if state["thumb"] is not None else None,
+            **metrics,
+            "contact_share": extra.get("contact_share", np.nan),
+            "press_share": extra.get("press_share", np.nan),
+        })
+    return {"candidates": pd.DataFrame(rows), "swatches": swatches, "thumbs": thumbs}
+
+
+def analyze_video(tracker, video_file, stride, max_width, show_preview):
+    """First pass: find and track the players, then measure each one. Returns the analysis."""
     tracker.reset()
-
+    src = video_file.read()
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        tmp.write(video_file.read())
+        tmp.write(src)
         video_path = tmp.name
-    out_path = video_path + ".out.mp4"
-    writer = None
 
     try:
         cap = cv2.VideoCapture(video_path)
@@ -379,58 +476,103 @@ def process_video(tracker, video_file, stride, max_width, show_preview):
         status_text = st.empty()
         placeholder = st.empty()
 
-        players = {}
         frame_no = 0
         while True:
-            ret, frame = cap.read()
+            ret, original = cap.read()
             if not ret:
                 break
             frame_no += 1
-
-            h, w = frame.shape[:2]
-            if w > max_width:
-                frame = cv2.resize(frame, (max_width, int(h * max_width / w)))
-            h, w = frame.shape[:2]
-            frame = frame[:h - h % 2, :w - w % 2]    # H.264 needs even dimensions
-
             if (frame_no - 1) % stride == 0:
-                annotated, players = tracker.process_frame(frame)
+                frame = fit_frame(original, max_width)
+                annotated, players = tracker.process_frame(
+                    frame, t=(frame_no - 1) / fps, frame_no=frame_no, source=original)
                 if show_preview:
                     placeholder.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), width="stretch")
-            else:
-                annotated = draw_players(frame, players)
-
-            if writer is None and frame_no == 1:
-                writer = open_video_writer(out_path, fps)
-            if writer is not None:
-                writer.append_data(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
-
-            if frame_no % 5 == 0 or frame_no == total_frames:
                 if total_frames > 0:
                     progress_bar.progress(min(frame_no / total_frames, 1.0))
-                    status_text.text(f"Frame {frame_no}/{total_frames} | Players on screen: {len(players)}")
-                else:
-                    status_text.text(f"Frame {frame_no} | Players on screen: {len(players)}")
-
+                status_text.text(f"Frame {frame_no}/{max(total_frames, frame_no)} | "
+                                 f"Players on screen: {len(players)} | Camera shots: {tracker.shot + 1}")
         cap.release()
-        if writer is not None:
-            writer.close()
-            writer = None
 
         progress_bar.progress(1.0)
-        status_text.text(f"Done. Analysed {tracker.frames_processed} of {frame_no} frames.")
+        status_text.text(f"Done. Analysed {tracker.frames_processed} of {frame_no} frames "
+                         f"across {tracker.shot + 1} camera shot(s).")
 
-        video_bytes = None
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
-            with open(out_path, "rb") as f:
-                video_bytes = f.read()
-
-        return {"stats": tracker.get_stats(stride / fps), "video": video_bytes}
+        analysis = build_candidates(tracker)
+        analysis.update({
+            "src": src, "fps": fps, "max_width": max_width,
+            "records": tracker.records, "shots": tracker.shot + 1,
+        })
+        return analysis
 
     except Exception as e:
         st.error(f"❌ Processing error: {e}")
         return None
 
+    finally:
+        try:
+            os.unlink(video_path)
+        except OSError:
+            pass
+
+
+def draw_highlights(frame, players, highlights):
+    """Faint boxes for everyone, bold gold boxes and a tag for the best-fit players."""
+    out = frame.copy()
+    frame_h = frame.shape[0]
+    scale = max(0.4, frame_h / 900)
+    thickness = max(2, frame_h // 200)
+
+    for key, info in players.items():
+        if key not in highlights:
+            x1, y1, x2, y2 = info["bbox"]
+            cv2.rectangle(out, (x1, y1), (x2, y2), (170, 170, 170), 1)
+
+    for key, info in players.items():
+        if key in highlights:
+            rank, score = highlights[key]
+            x1, y1, x2, y2 = info["bbox"]
+            cv2.rectangle(out, (x1, y1), (x2, y2), HIGHLIGHT_COLOR, thickness)
+            label = f"{rank}. {info['label']}  FIT {score:.0f}"
+            (tw, th), _ = cv2.getTextSize(label, FONT, scale, 2)
+            tag_bottom = max(th + 6, y1)
+            cv2.rectangle(out, (x1, tag_bottom - th - 6), (x1 + tw + 6, tag_bottom), HIGHLIGHT_COLOR, -1)
+            cv2.putText(out, label, (x1 + 3, tag_bottom - 4), FONT, scale, (0, 0, 0), 2, cv2.LINE_AA)
+    return out
+
+
+def render_highlight_video(analysis, highlights):
+    """Second pass: re-encode the video with the best-fit players highlighted."""
+    boxes_at = {r["frame_no"]: r["players"] for r in analysis["records"]}
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+        tmp.write(analysis["src"])
+        video_path = tmp.name
+    out_path = video_path + ".out.mp4"
+    writer = None
+
+    try:
+        cap = cv2.VideoCapture(video_path)
+        players, frame_no = {}, 0
+        while True:
+            ret, original = cap.read()
+            if not ret:
+                break
+            frame_no += 1
+            frame = fit_frame(original, analysis["max_width"])
+            players = boxes_at.get(frame_no, players)   # between analysed frames, reuse the last boxes
+            if writer is None:
+                writer = open_video_writer(out_path, analysis["fps"])
+                if writer is None:
+                    return None
+            writer.append_data(cv2.cvtColor(draw_highlights(frame, players, highlights), cv2.COLOR_BGR2RGB))
+        cap.release()
+        if writer is not None:
+            writer.close()
+            writer = None
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 0:
+            with open(out_path, "rb") as f:
+                return f.read()
+        return None
     finally:
         if writer is not None:
             try:
@@ -448,46 +590,47 @@ def process_video(tracker, video_file, stride, max_width, show_preview):
 # VIDEO TAB
 # =====================================================
 def render_video_tab():
-    st.caption(f"Running on: {'GPU (CUDA)' if torch.cuda.is_available() else 'CPU - use the Nano model for speed'}")
-    st.info(
-        "This tab tracks players in video you upload and shows who is on screen. It works best on a "
-        "fixed or slowly moving camera. It cannot measure speed, distance or passing from edited "
-        "highlights; use the Scouting tab for those."
+    st.write(
+        "Upload match highlights (for example from YouTube) and say what kind of player you need. "
+        "The AI finds and tracks the players on screen, estimates how each one moves, ranks them "
+        "against your requirement, and shows the best fits in the video."
+    )
+    with st.expander("What this can and can't tell you"):
+        st.markdown(
+            "- **Speed, distance and high-intensity running are estimates.** Each player's apparent height "
+            "is used as the scale, after removing the camera pan. It is indicative, not tracking-data accurate.\n"
+            "- **Pressing is a proxy:** time spent closing in on an opponent. The ball is not tracked.\n"
+            "- **Passing, dribbling success and exact position cannot be measured from highlights.** "
+            "Players are ranked on movement and pressing only.\n"
+            "- A player who appears in several camera shots shows up once per shot, because players are not "
+            "recognised across cuts yet.\n"
+            "- Shirt numbers are only readable in close-ups."
+        )
+
+    video_file = st.file_uploader("Upload highlights video", type=["mp4", "avi", "mov", "mkv", "flv"])
+    style = st.selectbox(
+        "What kind of player do you need?", list(vm.VIDEO_STYLES),
+        help="Decides which measurements count most towards the fit score.",
     )
 
-    video_file = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv", "flv"])
+    with st.expander("Advanced settings"):
+        st.caption(f"Running on: {'GPU (CUDA)' if torch.cuda.is_available() else 'CPU - the Nano model is fastest'}")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            model_label = st.selectbox("Detection model", list(MODEL_CHOICES), index=0,
+                                       help="Nano is the fastest. Medium is the most accurate but slow on CPU.")
+        with c2:
+            max_width = st.selectbox("Max video width (px)", WIDTH_CHOICES, index=1,
+                                     help="Larger videos are scaled down to this width. Smaller is faster.")
+        with c3:
+            stride = st.number_input("Analyse every N frames", min_value=1, max_value=30, value=3, step=1,
+                                     help="1 is the most precise and the slowest. 3 is a good balance.")
+        pitch_only = st.checkbox("Only players on the pitch", value=True,
+                                 help="Ignores people whose feet are not on grass. Turn off for non-grass pitches.")
+        show_preview = st.checkbox("Show live preview while analysing", value=False,
+                                   help="Slows processing down; the finished video plays smoothly.")
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    with c1:
-        model_label = st.selectbox(
-            "Detection model", list(MODEL_CHOICES), index=0,
-            help="Nano is the fastest. Medium is the most accurate but slow on CPU.",
-        )
-    with c2:
-        max_width = st.selectbox(
-            "Max video width (px)", WIDTH_CHOICES, index=1,
-            help="Larger videos are scaled down to this width. Smaller is faster.",
-        )
-    with c3:
-        stride = st.number_input(
-            "Analyse every N frames", min_value=1, max_value=30, value=3, step=1,
-            help="1 analyses every frame (slowest, most precise). Skipped frames reuse the latest boxes.",
-        )
-    with c4:
-        pitch_only = st.checkbox(
-            "Only players on the pitch", value=True,
-            help="Ignores people in the crowd or beside the pitch by checking for grass at their feet. "
-                 "Turn off for non-grass or indoor pitches.",
-        )
-        show_preview = st.checkbox(
-            "Show live preview", value=False,
-            help="Shows frames while processing. This slows processing down; the finished video plays smoothly.",
-        )
-    with c5:
-        st.write("")
-        process_btn = st.button("Process", type="primary", disabled=video_file is None)
-
-    if video_file is not None and process_btn:
+    if st.button("Analyse video", type="primary", disabled=video_file is None):
         try:
             with st.spinner("Loading models (the first use of a model downloads it)..."):
                 model = load_yolo(MODEL_CHOICES[model_label])
@@ -495,36 +638,126 @@ def render_video_tab():
         except Exception as e:
             st.error(f"❌ Failed to load models: {e}")
             st.stop()
-
         if ocr_warning:
             st.warning(ocr_warning)
 
         tracker = PlayerTracker(model, ocr, pitch_only=pitch_only)
-        st.session_state["result"] = process_video(
-            tracker, video_file, int(stride), int(max_width), show_preview
-        )
+        st.session_state["analysis"] = analyze_video(
+            tracker, video_file, int(stride), int(max_width), show_preview)
+        st.session_state.pop("highlight_video", None)
 
-    # Results live in session state so that clicking Download does not wipe them
-    result = st.session_state.get("result")
-    if result is not None:
-        if result["video"]:
-            st.subheader("🎬 Annotated Video")
-            st.video(result["video"])
-            st.download_button("📥 Download video", result["video"], "tracked_players.mp4", "video/mp4")
+    analysis = st.session_state.get("analysis")
+    if analysis is not None:
+        render_results(analysis, style)
 
-        st.subheader("📊 Player Statistics")
-        stats_df = result["stats"]
-        if stats_df.empty:
-            st.warning("⚠️ No players tracked for long enough. Try turning off 'Only players on the pitch', "
-                       "using a larger model, or a lower N.")
-        else:
-            st.dataframe(stats_df, width="stretch", hide_index=True)
-            st.download_button(
-                "📥 Download CSV",
-                stats_df.to_csv(index=False),
-                "player_stats.csv",
-                "text/csv",
-            )
+
+def swatch_html(name, hex_color):
+    box = (f"<span style='display:inline-block;width:14px;height:14px;border-radius:3px;"
+           f"background:{hex_color};border:1px solid #888;vertical-align:middle'></span>")
+    return f"{box} {name}"
+
+
+def render_results(analysis, style):
+    cands = analysis["candidates"]
+    st.success(f"Found {len(cands)} measurable players across {analysis['shots']} camera shot(s).")
+    if cands.empty:
+        st.warning("No player stayed on screen long enough to measure. Try a lower 'Analyse every N frames', "
+                   "a larger model, turning off 'Only players on the pitch', or a clip with longer shots.")
+        return
+
+    present = [t for t in ("Team A", "Team B", "Other") if t in set(cands["team"])]
+    st.markdown("**Teams found (grouped by shirt colour):** " + "  &nbsp;&nbsp;  ".join(
+        swatch_html(t, analysis["swatches"].get(t, "#888888")) for t in present), unsafe_allow_html=True)
+    teams = st.multiselect(
+        "Scout players from", present, default=[t for t in present if t != "Other"],
+        help="'Other' is usually the referee, goalkeepers or players whose kit colour was unclear.")
+    pool = cands[cands["team"].isin(teams)]
+    if pool.empty:
+        st.info("Select at least one team.")
+        return
+
+    base = vm.VIDEO_STYLES[style]
+    weights = {}
+    with st.expander("Fine-tune what matters (0 = ignore, 1 = very important)"):
+        cols = st.columns(2)
+        for i, metric in enumerate(vm.VIDEO_METRICS):
+            with cols[i % 2]:
+                weights[metric] = st.slider(
+                    vm.VIDEO_LABELS[metric], 0.0, 1.0, float(base.get(metric, 0.0)), 0.1,
+                    key=f"vw_{style}_{metric}", help=vm.VIDEO_HELP[metric])
+
+    table, pct = vm.rank_candidates(pool, weights)
+    if table.empty:
+        st.warning("Give at least one measurement a weight above zero.")
+        return
+    if len(table) < 5:
+        st.warning(f"Only {len(table)} players are being compared, so the percentiles are rough.")
+
+    st.markdown(f"### Best fits for: {style.lower()}")
+    top_n = st.slider("Highlight the top N players in the video", 1, min(10, len(table)), min(3, len(table)))
+    shown = table.assign(rank=range(1, len(table) + 1))[[
+        "rank", "photo", "player", "team", "shirt", "observed_s", "avg_speed_kmh", "top_speed_kmh",
+        "distance_m", "hi_share", "press_share", "fit_score"]]
+    st.dataframe(
+        shown, width="stretch", hide_index=True, row_height=64,
+        column_config={
+            "rank": st.column_config.NumberColumn("Rank", width="small"),
+            "photo": st.column_config.ImageColumn("Photo", width="small"),
+            "player": "Player", "team": "Team", "shirt": "Shirt #",
+            "observed_s": st.column_config.NumberColumn("Measured (s)", format="%.1f"),
+            "avg_speed_kmh": st.column_config.NumberColumn("Avg speed (km/h)", format="%.1f"),
+            "top_speed_kmh": st.column_config.NumberColumn("Top speed (km/h)", format="%.1f"),
+            "distance_m": st.column_config.NumberColumn("Distance (m)", format="%.0f"),
+            "hi_share": st.column_config.NumberColumn("High-intensity (%)", format="%.0f"),
+            "press_share": st.column_config.NumberColumn("Pressing (%)", format="%.0f"),
+            "fit_score": st.column_config.ProgressColumn("Fit score", min_value=0, max_value=100, format="%.0f"),
+        })
+    export = shown.drop(columns=["photo"]).rename(columns={
+        "rank": "Rank", "player": "Player", "team": "Team", "shirt": "Shirt", "observed_s": "Measured_s",
+        "avg_speed_kmh": "Avg_speed_kmh", "top_speed_kmh": "Top_speed_kmh", "distance_m": "Distance_m",
+        "hi_share": "High_intensity_pct", "press_share": "Pressing_pct", "fit_score": "Fit_score"})
+    st.download_button("📥 Download ranking (CSV)", export.to_csv(index=False), "video_ranking.csv", "text/csv")
+
+    # ---------- highlighted video ----------
+    st.markdown("### Highlighted video")
+    highlights = {table.loc[i, "key"]: (i + 1, float(table.loc[i, "fit_score"])) for i in range(top_n)}
+    signature = tuple(sorted(highlights.items()))
+    stale = st.session_state.get("highlight_signature") != signature
+    if stale and (st.session_state.get("highlight_video") is None or
+                  st.button("Update highlighted video for these settings")):
+        with st.spinner("Rendering the highlighted video..."):
+            st.session_state["highlight_video"] = render_highlight_video(analysis, highlights)
+            st.session_state["highlight_signature"] = signature
+    elif stale:
+        st.caption("Your settings changed. Click the button above to refresh the video.")
+    if st.session_state.get("highlight_video"):
+        st.video(st.session_state["highlight_video"])
+        st.download_button("📥 Download highlighted video", st.session_state["highlight_video"],
+                           "highlighted_players.mp4", "video/mp4")
+        st.caption("Gold boxes are the best fits, with their rank and fit score. Grey boxes are other players.")
+
+    # ---------- player report ----------
+    st.markdown("### Player report")
+    labels = {f"{i + 1}. {table.loc[i, 'player']} ({table.loc[i, 'team']})": i for i in range(len(table))}
+    chosen = st.selectbox("Player", list(labels))
+    i = labels[chosen]
+    row = table.loc[i]
+    left, right = st.columns([1, 4])
+    with left:
+        if row["key"] in analysis["thumbs"]:
+            st.image(analysis["thumbs"][row["key"]], width=120)
+    with right:
+        st.markdown(f"**{row['player']}** ({row['team']}): fit score **{row['fit_score']}** out of 100")
+        st.write(vm.explain_video(row, pct.loc[i], weights))
+        st.caption("Percentiles compare this player with the other players in this video only.")
+    detail = pd.DataFrame({
+        "Measurement": [vm.VIDEO_LABELS[m] for m in pct.columns],
+        "Importance": [weights[m] for m in pct.columns],
+        "Percentile (100 = best in this video)": pct.loc[i].round(0).astype(int).to_numpy(),
+        "Value": [round(float(row[m]), 1) if pd.notna(row[m]) else None for m in pct.columns],
+    })
+    st.bar_chart(detail.set_index("Measurement")["Percentile (100 = best in this video)"])
+    st.dataframe(detail, width="stretch", hide_index=True)
 
 
 # =====================================================
@@ -657,11 +890,11 @@ def main():
     st.set_page_config(page_title="⚽ Player Scouting", layout="wide")
     st.title("⚽ Player Scouting & Tracking")
 
-    scouting_tab, video_tab = st.tabs(["🔎 Scouting", "🎥 Video tracker"])
-    with scouting_tab:
-        render_scouting_tab()
+    video_tab, scouting_tab = st.tabs(["🎥 Analyse a video", "📊 Data scouting"])
     with video_tab:
         render_video_tab()
+    with scouting_tab:
+        render_scouting_tab()
 
 
 if __name__ == "__main__":
