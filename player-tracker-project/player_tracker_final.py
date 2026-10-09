@@ -25,29 +25,42 @@ MODEL_CHOICES = {
 WIDTH_CHOICES = [480, 640, 960, 1280]   # frames wider than this are scaled down
 
 PERSON_CONF = 0.4           # YOLO confidence threshold for "person"
+MIN_BOX_HEIGHT_FRAC = 0.04  # ignore detections shorter than 4% of the frame height
+MIN_TRACK_FRAMES = 5        # tracks seen in fewer analysed frames are dropped from the stats
 OCR_EVERY_N_FRAMES = 10     # try reading a shirt number on every Nth frame per track
 OCR_MAX_ATTEMPTS = 10       # give up on a track after this many OCR attempts
 OCR_MIN_CONF = 0.3
 
-# HSV ranges (OpenCV hue is 0-180). Red wraps around, so it has two ranges.
+# Grass in HSV (OpenCV hue is 0-180). Used to keep only people standing on the pitch
+# and to ignore grass pixels when reading shirt colours.
+GRASS_LOWER = (35, 40, 30)
+GRASS_UPPER = (90, 255, 255)
+PITCH_MIN_GRASS = 0.3       # share of grass around a person's feet to count as "on the pitch"
+
+# Camera pan estimation
+CAMERA_ANALYSIS_WIDTH = 320
+CAMERA_MIN_RESPONSE = 0.05  # below this the frames are too different (a cut); ignore the shift
+
+# Kit colours in HSV. Red wraps around, so it has two ranges. Green is left out on
+# purpose because grass would otherwise be read as a green team.
 TEAM_RANGES = {
     "Red": [((0, 100, 70), (10, 255, 255)), ((170, 100, 70), (180, 255, 255))],
     "Blue": [((100, 100, 50), (130, 255, 255))],
     "Yellow": [((18, 100, 100), (35, 255, 255))],
-    "Green": [((40, 80, 50), (85, 255, 255))],
     "White": [((0, 0, 170), (180, 50, 255))],
     "Black": [((0, 0, 0), (180, 255, 60))],
 }
-TEAM_MIN_SHARE = 0.2        # a team colour must cover at least 20% of the shirt area
+TEAM_MIN_SHARE = 0.3        # a kit colour must cover 30% of the non-grass shirt area
 TEAM_BOX_COLORS = {         # BGR colours used for drawing boxes
     "Red": (0, 0, 255),
     "Blue": (255, 0, 0),
     "Yellow": (0, 255, 255),
-    "Green": (0, 255, 0),
-    "White": (230, 230, 230),
-    "Black": (60, 60, 60),
-    "Unknown": (0, 255, 0),
+    "White": (235, 235, 235),
+    "Black": (70, 70, 70),
+    "Unknown": (0, 165, 255),
 }
+
+FONT = cv2.FONT_HERSHEY_SIMPLEX
 
 
 def _majority(counter):
@@ -73,18 +86,79 @@ def shirt_area(crop):
     return torso if torso.size else None
 
 
+def grass_mask(hsv):
+    return cv2.inRange(hsv, np.array(GRASS_LOWER, np.uint8), np.array(GRASS_UPPER, np.uint8))
+
+
+def on_pitch(grass, box):
+    """True if the ground around the person's feet is mostly grass."""
+    x1, y1, x2, y2 = box
+    h = y2 - y1
+    top = max(0, int(y2 - 0.15 * h))
+    bottom = min(grass.shape[0], int(y2 + 0.1 * h) + 1)
+    band = grass[top:bottom, x1:x2]
+    return band.size > 0 and np.count_nonzero(band) / band.size >= PITCH_MIN_GRASS
+
+
+def appearance_embedding(shirt):
+    """Small colour histogram of the shirt, used by the tracker to tell players apart."""
+    size = 12 * 4
+    if shirt is None:
+        return np.full(size, 1.0 / np.sqrt(size), np.float32)
+    hsv = cv2.cvtColor(shirt, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1], None, [12, 4], [0, 180, 0, 256]).flatten()
+    norm = np.linalg.norm(hist)
+    if norm == 0:
+        return np.full(size, 1.0 / np.sqrt(size), np.float32)
+    return (hist / norm).astype(np.float32)
+
+
+class CameraMotion:
+    """Estimates how far a panning camera has moved, so players can be tracked in
+    a stable coordinate system instead of jumping around with every pan."""
+
+    def __init__(self):
+        self.prev = None
+        self.window = None
+        self.offset = np.zeros(2)   # total shift of the picture content since the first frame
+
+    def update(self, frame):
+        h, w = frame.shape[:2]
+        scale = CAMERA_ANALYSIS_WIDTH / w if w > CAMERA_ANALYSIS_WIDTH else 1.0
+        gray = cv2.cvtColor(cv2.resize(frame, None, fx=scale, fy=scale), cv2.COLOR_BGR2GRAY)
+        gray = np.float32(gray)
+
+        if self.prev is not None and self.prev.shape == gray.shape:
+            if self.window is None or self.window.shape != gray.shape:
+                self.window = cv2.createHanningWindow((gray.shape[1], gray.shape[0]), cv2.CV_32F)
+            (dx, dy), response = cv2.phaseCorrelate(self.prev, gray, self.window)
+            if response >= CAMERA_MIN_RESPONSE:
+                self.offset += (dx / scale, dy / scale)
+        self.prev = gray
+        return self.offset
+
+
 def draw_players(frame, players):
-    """Return a copy of frame with a labelled box for each player."""
+    """Return a copy of frame with a thin box and a small ID tag for each player."""
     annotated = frame.copy()
+    frame_h = frame.shape[0]
+    thickness = 1 if frame_h < 600 else 2
+    scale = max(0.35, frame_h / 1200)
+
     for track_id, info in players.items():
         x1, y1, x2, y2 = info["bbox"]
         color = TEAM_BOX_COLORS.get(info["team"], TEAM_BOX_COLORS["Unknown"])
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        label = f"ID:{track_id} | #{info['shirt_number']} | {info['team']}"
-        cv2.putText(
-            annotated, label, (x1, max(25, y1 - 10)),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2,
-        )
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+
+        label = str(track_id)
+        if info["shirt_number"] != "?":
+            label += f" #{info['shirt_number']}"
+        (text_w, text_h), _ = cv2.getTextSize(label, FONT, scale, 1)
+        tag_bottom = max(text_h + 4, y1)
+        cv2.rectangle(annotated, (x1, tag_bottom - text_h - 4), (x1 + text_w + 4, tag_bottom), color, -1)
+        text_color = (0, 0, 0) if sum(color) > 300 else (255, 255, 255)
+        cv2.putText(annotated, label, (x1 + 2, tag_bottom - 3), FONT, scale, text_color, 1, cv2.LINE_AA)
+
     return annotated
 
 
@@ -93,24 +167,33 @@ def draw_players(frame, players):
 # =====================================================
 class PlayerTracker:
 
-    def __init__(self, model, ocr):
+    def __init__(self, model, ocr, pitch_only=True):
         self.model = model
-        self.ocr = ocr          # may be None, in which case shirt numbers are skipped
+        self.ocr = ocr              # may be None, in which case shirt numbers are skipped
+        self.pitch_only = pitch_only
         self.reset()
 
     def reset(self):
         """Clear all tracking state so a new video starts from scratch."""
-        self.deepsort = DeepSort(embedder="mobilenet", max_age=30, n_init=2, nn_budget=100)
+        # Appearance features are supplied by us (shirt colour histograms), so no
+        # image embedder is created.
+        self.deepsort = DeepSort(
+            embedder=None, max_age=30, n_init=3, nn_budget=100, max_cosine_distance=0.3,
+        )
+        self.camera = CameraMotion()
         self.tracks = defaultdict(_new_track_state)
         self.frames_processed = 0
 
     def detect_team(self, shirt):
-        """Return the dominant team colour in the shirt area, or 'Unknown'."""
+        """Return the dominant kit colour in the shirt area (ignoring grass), or 'Unknown'."""
         if shirt is None:
             return "Unknown"
 
         hsv = cv2.cvtColor(shirt, cv2.COLOR_BGR2HSV)
-        total = shirt.shape[0] * shirt.shape[1]
+        grass = grass_mask(hsv)
+        usable = shirt.shape[0] * shirt.shape[1] - np.count_nonzero(grass)
+        if usable < 0.25 * shirt.shape[0] * shirt.shape[1]:
+            return "Unknown"        # mostly grass: no reliable kit colour
 
         best_team, best_share = "Unknown", 0.0
         for team, ranges in TEAM_RANGES.items():
@@ -118,7 +201,7 @@ class PlayerTracker:
             for lower, upper in ranges:
                 mask = cv2.inRange(hsv, np.array(lower, np.uint8), np.array(upper, np.uint8))
                 pixels += np.count_nonzero(mask)
-            share = pixels / total
+            share = pixels / usable
             if share > best_share:
                 best_team, best_share = team, share
 
@@ -138,33 +221,54 @@ class PlayerTracker:
 
         return str(int(best_text)).zfill(2) if best_text else None
 
+    def _detect_people(self, frame):
+        """YOLO detections of people on the pitch, as ints (x1, y1, x2, y2) with confidence."""
+        frame_h, frame_w = frame.shape[:2]
+        results = self.model(frame, classes=[0], conf=PERSON_CONF, verbose=False)
+        boxes = results[0].boxes
+        if boxes is None or len(boxes) == 0:
+            return []
+
+        grass = grass_mask(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)) if self.pitch_only else None
+
+        people = []
+        for (x1, y1, x2, y2), conf in zip(boxes.xyxy.cpu().numpy(), boxes.conf.cpu().numpy()):
+            x1, y1 = max(0, int(x1)), max(0, int(y1))
+            x2, y2 = min(frame_w, int(x2)), min(frame_h, int(y2))
+            if x2 <= x1 or y2 - y1 < MIN_BOX_HEIGHT_FRAC * frame_h:
+                continue
+            if grass is not None and not on_pitch(grass, (x1, y1, x2, y2)):
+                continue
+            people.append(((x1, y1, x2, y2), float(conf)))
+        return people
+
     def process_frame(self, frame):
         """Detect and track players in one frame. Returns (annotated_frame, players)."""
         self.frames_processed += 1
-
-        results = self.model(frame, classes=[0], conf=PERSON_CONF, verbose=False)
-        boxes = results[0].boxes
-
-        detection_list = []
-        if boxes is not None and len(boxes) > 0:
-            for (x1, y1, x2, y2), conf in zip(boxes.xyxy.cpu().numpy(), boxes.conf.cpu().numpy()):
-                detection_list.append(
-                    ([float(x1), float(y1), float(x2 - x1), float(y2 - y1)], float(conf), "player")
-                )
-
-        tracks = self.deepsort.update_tracks(detection_list, frame=frame)
-
-        players = {}
         frame_h, frame_w = frame.shape[:2]
 
+        # Track in camera-stabilised coordinates so a panning camera does not make
+        # every player look like they jumped.
+        off_x, off_y = self.camera.update(frame)
+
+        detections, embeds = [], []
+        for (x1, y1, x2, y2), conf in self._detect_people(frame):
+            detections.append(([x1 - off_x, y1 - off_y, x2 - x1, y2 - y1], conf, "player"))
+            embeds.append(appearance_embedding(shirt_area(frame[y1:y2, x1:x2])))
+
+        tracks = self.deepsort.update_tracks(detections, embeds=embeds)
+
+        players = {}
         for track in tracks:
-            if not track.is_confirmed():
+            # Skip tracks that were not matched to a detection in this frame: their box
+            # is only a prediction and would show up as an empty ghost box.
+            if not track.is_confirmed() or track.time_since_update > 0:
                 continue
 
             track_id = track.track_id
-            x1, y1, x2, y2 = (int(v) for v in track.to_ltrb())
-            x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(frame_w, x2), min(frame_h, y2)
+            l, t, r, b = track.to_ltrb()
+            x1, y1 = max(0, int(l + off_x)), max(0, int(t + off_y))
+            x2, y2 = min(frame_w, int(r + off_x)), min(frame_h, int(b + off_y))
             if x2 <= x1 or y2 <= y1:
                 continue
 
@@ -192,24 +296,23 @@ class PlayerTracker:
 
         return draw_players(frame, players), players
 
-    def get_stats(self):
-        """One row per tracked player, sorted by how often they were seen."""
-        total = max(1, self.frames_processed)
+    def get_stats(self, seconds_per_frame):
+        """One row per tracked player (brief, noisy tracks are dropped), longest first."""
         rows = []
         for track_id, state in self.tracks.items():
-            if state["frames"] == 0:
+            if state["frames"] < MIN_TRACK_FRAMES:
                 continue
             rows.append({
                 "Player ID": track_id,
                 "Shirt Number": _majority(state["numbers"]) or "N/A",
                 "Team": _majority(state["teams"]) or "Unknown",
-                "Frames Detected": state["frames"],
-                "Detection Rate": f"{state['frames'] / total * 100:.1f}%",
+                "Time on screen (s)": round(state["frames"] * seconds_per_frame, 1),
+                "Frames Analysed": state["frames"],
             })
 
         if not rows:
             return pd.DataFrame()
-        return pd.DataFrame(rows).sort_values("Frames Detected", ascending=False)
+        return pd.DataFrame(rows).sort_values("Time on screen (s)", ascending=False)
 
 
 # =====================================================
@@ -320,7 +423,7 @@ def process_video(tracker, video_file, stride, max_width, show_preview):
             with open(out_path, "rb") as f:
                 video_bytes = f.read()
 
-        return {"stats": tracker.get_stats(), "video": video_bytes}
+        return {"stats": tracker.get_stats(stride / fps), "video": video_bytes}
 
     except Exception as e:
         st.error(f"❌ Processing error: {e}")
@@ -351,7 +454,7 @@ def main():
 
     video_file = st.file_uploader("Upload video", type=["mp4", "avi", "mov", "mkv", "flv"])
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     with c1:
         model_label = st.selectbox(
             "Detection model", list(MODEL_CHOICES), index=0,
@@ -368,12 +471,18 @@ def main():
             help="1 analyses every frame (slowest, most precise). Skipped frames reuse the latest boxes.",
         )
     with c4:
+        pitch_only = st.checkbox(
+            "Only players on the pitch", value=True,
+            help="Ignores people in the crowd or beside the pitch by checking for grass at their feet. "
+                 "Turn off for non-grass or indoor pitches.",
+        )
         show_preview = st.checkbox(
             "Show live preview", value=False,
             help="Shows frames while processing. This slows processing down; the finished video plays smoothly.",
         )
-
-    process_btn = st.button("Process", type="primary", disabled=video_file is None)
+    with c5:
+        st.write("")
+        process_btn = st.button("Process", type="primary", disabled=video_file is None)
 
     if video_file is not None and process_btn:
         try:
@@ -387,7 +496,7 @@ def main():
         if ocr_warning:
             st.warning(ocr_warning)
 
-        tracker = PlayerTracker(model, ocr)
+        tracker = PlayerTracker(model, ocr, pitch_only=pitch_only)
         st.session_state["result"] = process_video(
             tracker, video_file, int(stride), int(max_width), show_preview
         )
@@ -403,7 +512,8 @@ def main():
         st.subheader("📊 Player Statistics")
         stats_df = result["stats"]
         if stats_df.empty:
-            st.warning("⚠️ No players detected in video")
+            st.warning("⚠️ No players tracked for long enough. Try turning off 'Only players on the pitch', "
+                       "using a larger model, or a lower N.")
         else:
             st.dataframe(stats_df, width="stretch", hide_index=True)
             st.download_button(

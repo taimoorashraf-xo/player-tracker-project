@@ -69,6 +69,7 @@ The app analyses frames one at a time, which is slow on a CPU, so the live previ
 - **Detection model** - Nano is the fastest, Medium the most accurate. Nano and Small weights download automatically the first time you pick them.
 - **Max video width** - Wider videos are scaled down. Smaller is faster.
 - **Analyse every N frames** - 1 analyses every frame (slowest, most precise). With 3, two of every three frames reuse the latest boxes, so the output video stays smooth but boxes can lag slightly on fast movement.
+- **Only players on the pitch** - On by default. People whose feet are not on grass (crowd, advertising boards) are ignored. Turn it off for indoor or non-grass pitches.
 - **Show live preview** - Off by default because sending frames to the browser slows processing.
 - A CUDA GPU speeds everything up a lot; the page shows whether the app is running on GPU or CPU.
 
@@ -81,11 +82,14 @@ The app analyses frames one at a time, which is slow on a CPU, so the live previ
 
 ## Output Statistics
 
-- Player ID (persistent tracking)
-- Shirt Number (OCR detected)
-- Team (color detected)
-- Frames Detected (appearance count)
-- Detection Rate (%)
+- Player ID (tracking ID)
+- Shirt Number (OCR detected, if readable)
+- Team (kit colour; grass is ignored)
+- Time on screen (seconds) and Frames Analysed
+
+Tracks seen in fewer than 5 analysed frames are left out, because they are almost always noise.
+
+These figures describe what the camera showed, not match performance. Distance, speed and similar scouting metrics are not calculated yet.
 
 ## Troubleshooting
 
@@ -94,9 +98,6 @@ The app analyses frames one at a time, which is slow on a CPU, so the live previ
 pip install --upgrade pip
 pip install -r requirements.txt --no-cache-dir
 ```
-
-### `pkg_resources` / `No module named 'pkg_resources'`
-The tracker's dependency `deep-sort-realtime` needs `setuptools<81`. It is pinned in `requirements.txt`; re-run `pip install -r requirements.txt` if you installed before this was added.
 
 ### Port 8501 Already in Use
 ```bash
@@ -138,11 +139,12 @@ player-tracker-project/
 - **YOLOv8 Medium** - Person detection
 - **EasyOCR** - Shirt number extraction
 - **DeepSort** - Player tracking
-- **MobileNet** (via DeepSort) - Appearance features for re-identification
+- **Shirt-colour histograms** - Appearance features that help the tracker tell players apart
+- **Camera-pan compensation** - Tracking uses a stabilised coordinate system, so a panning broadcast camera does not break IDs
 
 ## Performance
 
-Processing time depends heavily on the model size, video width, CPU/GPU and the "Analyse every N frames" setting. Measure on your own machine before relying on a time estimate. Each processed frame runs YOLOv8m detection plus DeepSort, so CPU-only runs on long videos take a while.
+Processing time depends heavily on the model size, video width, CPU/GPU and the "Analyse every N frames" setting. Measure on your own machine before relying on a time estimate. Each processed frame runs YOLO detection plus DeepSort, so CPU-only runs on long videos take a while.
 
 ## Notes
 
