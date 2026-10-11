@@ -146,6 +146,8 @@ player-tracker-project/
 ├── video_metrics.py            (Speed, pressing, team grouping and ranking from video)
 ├── scouting.py                 (Data scouting metrics and fit scoring)
 ├── demo_data.py                (Clearly labelled simulated placeholders for demos)
+├── ui_theme.py                 (Design system: theme CSS and HTML components)
+├── .streamlit/config.toml      (Dark theme; start the app from this folder so it is picked up)
 ├── yolov8m.pt                  (YOLOv8 medium weights; nano/small download on first use)
 ├── data_cache/                 (Downloaded match data; created automatically)
 ├── requirements.txt            (Dependencies)
