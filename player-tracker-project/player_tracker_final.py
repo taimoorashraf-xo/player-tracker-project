@@ -14,6 +14,7 @@ from ultralytics import YOLO
 
 import demo_data
 import scouting
+import ui_theme as ui
 import video_metrics as vm
 
 # =====================================================
@@ -590,12 +591,52 @@ def render_highlight_video(analysis, highlights):
 # =====================================================
 # VIDEO TAB
 # =====================================================
+VIDEO_STEPS = ["Upload clip", "Choose player type", "Analyse", "Review shortlist"]
+STYLE_BLURBS = {
+    "High press": "Rewards players who keep running, cover ground and close down opponents.",
+    "Counter-attack (pace)": "Rewards raw pace: top speed and repeated high-intensity runs.",
+    "Work rate (box-to-box)": "Rewards distance covered and sustained running.",
+    "Balanced athletic": "Rewards an even mix of pace, stamina and pressing.",
+}
+
+
 def render_video_tab():
-    st.write(
-        "Upload match highlights (for example from YouTube) and say what kind of player you need. "
-        "The AI finds and tracks the players on screen, estimates how each one moves, ranks them "
-        "against your requirement, and shows the best fits in the video."
-    )
+    analysis = st.session_state.get("analysis")
+    steps_slot = st.empty()
+
+    with st.container(border=True):
+        left, right = st.columns([3, 2], gap="large")
+        with left:
+            st.markdown("##### 1 · Your clip")
+            video_file = st.file_uploader("Upload highlights video", type=["mp4", "avi", "mov", "mkv", "flv"])
+        with right:
+            st.markdown("##### 2 · Your requirement")
+            style = st.selectbox(
+                "What kind of player do you need?", list(vm.VIDEO_STYLES),
+                help="Decides which measurements count most towards the fit score.")
+            st.caption(STYLE_BLURBS.get(style, ""))
+
+        with st.expander("Advanced settings"):
+            st.caption(f"Running on: {'GPU (CUDA)' if torch.cuda.is_available() else 'CPU - the Nano model is fastest'}")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                model_label = st.selectbox("Detection model", list(MODEL_CHOICES), index=0,
+                                           help="Nano is the fastest. Medium is the most accurate but slow on CPU.")
+            with c2:
+                max_width = st.selectbox("Max video width (px)", WIDTH_CHOICES, index=1,
+                                         help="Larger videos are scaled down to this width. Smaller is faster.")
+            with c3:
+                stride = st.number_input("Analyse every N frames", min_value=1, max_value=30, value=3, step=1,
+                                         help="1 is the most precise and the slowest. 3 is a good balance.")
+            pitch_only = st.checkbox("Only players on the pitch", value=True,
+                                     help="Ignores people whose feet are not on grass. Turn off for non-grass pitches.")
+            show_preview = st.checkbox("Show live preview while analysing", value=False,
+                                       help="Slows processing down; the finished video plays smoothly.")
+
+        analyse = st.button("Analyse video", type="primary", disabled=video_file is None)
+        if video_file is None:
+            st.caption("Upload a clip to enable the analysis.")
+
     with st.expander("What this can and can't tell you"):
         st.markdown(
             "- **Speed, distance and high-intensity running are estimates.** Each player's apparent height "
@@ -608,30 +649,7 @@ def render_video_tab():
             "- Shirt numbers are only readable in close-ups."
         )
 
-    video_file = st.file_uploader("Upload highlights video", type=["mp4", "avi", "mov", "mkv", "flv"])
-    style = st.selectbox(
-        "What kind of player do you need?", list(vm.VIDEO_STYLES),
-        help="Decides which measurements count most towards the fit score.",
-    )
-
-    with st.expander("Advanced settings"):
-        st.caption(f"Running on: {'GPU (CUDA)' if torch.cuda.is_available() else 'CPU - the Nano model is fastest'}")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            model_label = st.selectbox("Detection model", list(MODEL_CHOICES), index=0,
-                                       help="Nano is the fastest. Medium is the most accurate but slow on CPU.")
-        with c2:
-            max_width = st.selectbox("Max video width (px)", WIDTH_CHOICES, index=1,
-                                     help="Larger videos are scaled down to this width. Smaller is faster.")
-        with c3:
-            stride = st.number_input("Analyse every N frames", min_value=1, max_value=30, value=3, step=1,
-                                     help="1 is the most precise and the slowest. 3 is a good balance.")
-        pitch_only = st.checkbox("Only players on the pitch", value=True,
-                                 help="Ignores people whose feet are not on grass. Turn off for non-grass pitches.")
-        show_preview = st.checkbox("Show live preview while analysing", value=False,
-                                   help="Slows processing down; the finished video plays smoothly.")
-
-    if st.button("Analyse video", type="primary", disabled=video_file is None):
+    if analyse:
         try:
             with st.spinner("Loading models (the first use of a model downloads it)..."):
                 model = load_yolo(MODEL_CHOICES[model_label])
@@ -643,13 +661,19 @@ def render_video_tab():
             st.warning(ocr_warning)
 
         tracker = PlayerTracker(model, ocr, pitch_only=pitch_only)
-        st.session_state["analysis"] = analyze_video(
-            tracker, video_file, int(stride), int(max_width), show_preview)
+        with st.container(border=True):
+            st.markdown("##### Analysing")
+            st.session_state["analysis"] = analyze_video(
+                tracker, video_file, int(stride), int(max_width), show_preview)
         st.session_state.pop("highlight_video", None)
 
     analysis = st.session_state.get("analysis")
+    stage = 3 if analysis is not None else (1 if video_file is not None else 0)
+    steps_slot.markdown(ui.stepper(stage, VIDEO_STEPS), unsafe_allow_html=True)
     if analysis is not None:
         render_results(analysis, style)
+    else:
+        ui.render(ui.how_it_works())
 
 
 def resolve_identity(analysis, cands, tags, demo):
@@ -683,77 +707,94 @@ def swatch_html(name, hex_color):
     return f"{box} {name}"
 
 
+def finite(value, fmt="{:.1f}", fallback="–"):
+    return fmt.format(value) if isinstance(value, (int, float, np.floating)) and pd.notna(value) else fallback
+
+
 def render_results(analysis, style):
     cands = analysis["candidates"]
-    st.success(f"Found {len(cands)} measurable players across {analysis['shots']} camera shot(s).")
     if cands.empty:
         st.warning("No player stayed on screen long enough to measure. Try a lower 'Analyse every N frames', "
                    "a larger model, turning off 'Only players on the pitch', or a clip with longer shots.")
         return
 
+    swatches = analysis["swatches"]
     present = [t for t in ("Team A", "Team B", "Other") if t in set(cands["team"])]
-    st.markdown("**Teams found (grouped by shirt colour):** " + "  &nbsp;&nbsp;  ".join(
-        swatch_html(t, analysis["swatches"].get(t, "#888888")) for t in present), unsafe_allow_html=True)
-    teams = st.multiselect(
-        "Scout players from", present, default=[t for t in present if t != "Other"],
-        help="'Other' is usually the referee, goalkeepers or players whose kit colour was unclear.")
+    st.markdown("### Results")
+    ui.render(ui.tiles([
+        (len(cands), "players measured"),
+        (analysis["shots"], "camera shots"),
+        (len([t for t in present if t != "Other"]), "teams found"),
+        (f"{cands['observed_s'].mean():.1f}s", "average time measured"),
+    ]))
 
-    # ---------- names and positions (typed by you, or simulated in demo mode) ----------
-    demo = st.checkbox(
-        "Demo mode: fill in names, positions and passing figures with simulated data", key="demo_mode",
-        help="Highlights alone cannot tell us who a player is or how they pass. Demo mode adds clearly "
-             "labelled placeholders so the full flow can be shown. They never change the fit score.")
-    if demo:
-        st.warning("Demo mode is on: names, positions, shirt numbers and passing figures are SIMULATED "
-                   "placeholders, not measured. Say so when you present the results.")
-    tags = st.session_state.setdefault("tags", {})
-    defaults = resolve_identity(analysis, cands, {}, demo)
-    current = resolve_identity(analysis, cands, tags, demo)
-    with st.expander("Edit names, positions and shirt numbers (your own input)"):
-        editor = pd.DataFrame({"Player": current["player"], "Name": current["name"],
-                               "Position": current["position"], "Shirt #": current["shirt_eff"]})
-        edited = st.data_editor(
-            editor, key=f"tag_editor_{demo}", hide_index=True, width="stretch", disabled=["Player"],
-            column_config={"Position": st.column_config.SelectboxColumn(
-                options=[""] + demo_data.POSITIONS)})
-        for i in range(len(edited)):
-            key = cands.iloc[i]["key"]
-            for field, column in (("name", "Name"), ("position", "Position"), ("shirt", "Shirt #")):
-                typed = edited.iloc[i][column] or ""
-                shown_default = defaults.iloc[i]["shirt_eff" if field == "shirt" else field]
-                if typed != shown_default:
-                    tags.setdefault(key, {})[field] = typed
-                elif key in tags:
-                    tags[key].pop(field, None)
+    # ---------- filters ----------
+    with st.container(border=True):
+        st.markdown("##### Who to scout")
+        col_a, col_b = st.columns(2, gap="large")
+        with col_a:
+            ui.render(ui.swatches([(t, swatches.get(t, "#888888")) for t in present], "Teams found by shirt colour:"))
+            teams = st.multiselect(
+                "Scout players from", present, default=[t for t in present if t != "Other"],
+                help="'Other' is usually the referee, goalkeepers or players whose kit colour was unclear.")
+        with col_b:
+            demo = st.checkbox(
+                "Demo mode: fill in names, positions and passing figures with simulated data", key="demo_mode",
+                help="Highlights alone cannot tell us who a player is or how they pass. Demo mode adds clearly "
+                     "labelled placeholders so the full flow can be shown. They never change the fit score.")
+            if demo:
+                st.warning("Demo mode is on: names, positions, shirt numbers and passing figures are SIMULATED "
+                           "placeholders, not measured. Say so when you present the results.")
+
+        tags = st.session_state.setdefault("tags", {})
+        defaults = resolve_identity(analysis, cands, {}, demo)
         current = resolve_identity(analysis, cands, tags, demo)
+        with st.expander("Edit names, positions and shirt numbers (your own input)"):
+            editor = pd.DataFrame({"Player": current["player"], "Name": current["name"],
+                                   "Position": current["position"], "Shirt #": current["shirt_eff"]})
+            edited = st.data_editor(
+                editor, key=f"tag_editor_{demo}", hide_index=True, width="stretch", disabled=["Player"],
+                column_config={"Position": st.column_config.SelectboxColumn(
+                    options=[""] + demo_data.POSITIONS)})
+            for i in range(len(edited)):
+                key = cands.iloc[i]["key"]
+                for field, column in (("name", "Name"), ("position", "Position"), ("shirt", "Shirt #")):
+                    typed = edited.iloc[i][column] or ""
+                    shown_default = defaults.iloc[i]["shirt_eff" if field == "shirt" else field]
+                    if typed != shown_default:
+                        tags.setdefault(key, {})[field] = typed
+                    elif key in tags:
+                        tags[key].pop(field, None)
+            current = resolve_identity(analysis, cands, tags, demo)
 
-    labelled = current.copy()
-    for column in ("name", "position"):
-        labelled[column] = [
-            (f"{v} (demo)" if v and src == "demo" else v)
-            for v, src in zip(current[column], current["id_source"])]
-    pool = labelled[labelled["team"].isin(teams)]
-    present_positions = sorted({p for p in current.loc[pool.index, "position"] if p})
-    wanted = "Any"
-    if present_positions:
-        wanted = st.selectbox("Position needed", ["Any"] + present_positions,
-                              help="Only players tagged with this position are ranked.")
-    if wanted != "Any":
-        pool = pool[current.loc[pool.index, "position"] == wanted]
+        labelled = current.copy()
+        for column in ("name", "position"):
+            labelled[column] = [
+                (f"{v} (demo)" if v and src == "demo" else v)
+                for v, src in zip(current[column], current["id_source"])]
+        pool = labelled[labelled["team"].isin(teams)]
+        present_positions = sorted({p for p in current.loc[pool.index, "position"] if p})
+        wanted = "Any"
+        if present_positions:
+            with col_a:
+                wanted = st.selectbox("Position needed", ["Any"] + present_positions,
+                                      help="Only players tagged with this position are ranked.")
+        if wanted != "Any":
+            pool = pool[current.loc[pool.index, "position"] == wanted]
+
+        base = vm.VIDEO_STYLES[style]
+        weights = {}
+        with st.expander("Fine-tune what matters (0 = ignore, 1 = very important)"):
+            cols = st.columns(2)
+            for i, metric in enumerate(vm.VIDEO_METRICS):
+                with cols[i % 2]:
+                    weights[metric] = st.slider(
+                        vm.VIDEO_LABELS[metric], 0.0, 1.0, float(base.get(metric, 0.0)), 0.1,
+                        key=f"vw_{style}_{metric}", help=vm.VIDEO_HELP[metric])
+
     if pool.empty:
         st.info("No players match the selected teams and position.")
         return
-
-    base = vm.VIDEO_STYLES[style]
-    weights = {}
-    with st.expander("Fine-tune what matters (0 = ignore, 1 = very important)"):
-        cols = st.columns(2)
-        for i, metric in enumerate(vm.VIDEO_METRICS):
-            with cols[i % 2]:
-                weights[metric] = st.slider(
-                    vm.VIDEO_LABELS[metric], 0.0, 1.0, float(base.get(metric, 0.0)), 0.1,
-                    key=f"vw_{style}_{metric}", help=vm.VIDEO_HELP[metric])
-
     table, pct = vm.rank_candidates(pool, weights)
     if table.empty:
         st.warning("Give at least one measurement a weight above zero.")
@@ -761,58 +802,84 @@ def render_results(analysis, style):
     if len(table) < 5:
         st.warning(f"Only {len(table)} players are being compared, so the percentiles are rough.")
 
-    st.markdown(f"### Best fits for: {style.lower()}")
-    if len(table) > 1:
-        top_n = st.slider("Highlight the top N players in the video", 1, min(10, len(table)), min(3, len(table)))
-    else:
-        top_n = 1
+    # ---------- top picks ----------
+    st.markdown(f"### Top picks · {style.lower()}")
+    cards = []
+    for i in range(min(3, len(table))):
+        r = table.iloc[i]
+        title = r["name"] or r["player"]
+        sub = " · ".join(x for x in (r["team"], r["position"], r["player"] if r["name"] else "") if x)
+        uri = r["photo"] if isinstance(r["photo"], str) else None
+        cards.append({"title": title, "sub": sub, "swatch": swatches.get(r["team"]), "photo_uri": uri,
+                      "fallback": r["player"], "score": float(r["fit_score"]),
+                      "stats": [(finite(r["avg_speed_kmh"]), "avg km/h"), (finite(r["top_speed_kmh"]), "top km/h"),
+                                (finite(r["press_share"], "{:.0f}%"), "pressing")]})
+    ui.render(ui.picks(cards))
+
+    # ---------- full ranking ----------
     columns = ["rank", "photo", "player", "name", "position", "team", "shirt_eff", "observed_s",
                "avg_speed_kmh", "top_speed_kmh", "distance_m", "hi_share", "press_share", "fit_score"]
     if demo:
         columns += ["pass_pct_demo", "prog_passes_demo"]
     shown = table.assign(rank=range(1, len(table) + 1))[columns]
-    st.dataframe(
-        shown, width="stretch", hide_index=True, row_height=64,
-        column_config={
-            "rank": st.column_config.NumberColumn("Rank", width="small"),
-            "photo": st.column_config.ImageColumn("Photo", width="small"),
-            "player": "Player", "name": "Name", "position": "Position", "team": "Team",
-            "shirt_eff": "Shirt #",
-            "pass_pct_demo": st.column_config.NumberColumn("Pass completion % (demo)", format="%.0f"),
-            "prog_passes_demo": st.column_config.NumberColumn("Progressive passes/90 (demo)", format="%.1f"),
-            "observed_s": st.column_config.NumberColumn("Measured (s)", format="%.1f"),
-            "avg_speed_kmh": st.column_config.NumberColumn("Avg speed (km/h)", format="%.1f"),
-            "top_speed_kmh": st.column_config.NumberColumn("Top speed (km/h)", format="%.1f"),
-            "distance_m": st.column_config.NumberColumn("Distance (m)", format="%.0f"),
-            "hi_share": st.column_config.NumberColumn("High-intensity (%)", format="%.0f"),
-            "press_share": st.column_config.NumberColumn("Pressing (%)", format="%.0f"),
-            "fit_score": st.column_config.ProgressColumn("Fit score", min_value=0, max_value=100, format="%.0f"),
-        })
-    export = shown.drop(columns=["photo"]).assign(identity_source=table["id_source"].replace("", "measured/none")).rename(columns={
-        "rank": "Rank", "player": "Player", "name": "Name", "position": "Position", "team": "Team",
-        "shirt_eff": "Shirt", "pass_pct_demo": "Pass_pct_DEMO", "prog_passes_demo": "Prog_passes_DEMO",
-        "observed_s": "Measured_s",
-        "avg_speed_kmh": "Avg_speed_kmh", "top_speed_kmh": "Top_speed_kmh", "distance_m": "Distance_m",
-        "hi_share": "High_intensity_pct", "press_share": "Pressing_pct", "fit_score": "Fit_score"})
-    st.download_button("📥 Download ranking (CSV)", export.to_csv(index=False), "video_ranking.csv", "text/csv")
+    with st.expander("Full ranking and export", expanded=len(table) > 3):
+        st.dataframe(
+            shown, width="stretch", hide_index=True, row_height=64,
+            column_config={
+                "rank": st.column_config.NumberColumn("Rank", width="small"),
+                "photo": st.column_config.ImageColumn("Photo", width="small"),
+                "player": "Player", "name": "Name", "position": "Position", "team": "Team",
+                "shirt_eff": "Shirt #",
+                "pass_pct_demo": st.column_config.NumberColumn("Pass completion % (demo)", format="%.0f"),
+                "prog_passes_demo": st.column_config.NumberColumn("Progressive passes/90 (demo)", format="%.1f"),
+                "observed_s": st.column_config.NumberColumn("Measured (s)", format="%.1f"),
+                "avg_speed_kmh": st.column_config.NumberColumn("Avg speed (km/h)", format="%.1f"),
+                "top_speed_kmh": st.column_config.NumberColumn("Top speed (km/h)", format="%.1f"),
+                "distance_m": st.column_config.NumberColumn("Distance (m)", format="%.0f"),
+                "hi_share": st.column_config.NumberColumn("High-intensity (%)", format="%.0f"),
+                "press_share": st.column_config.NumberColumn("Pressing (%)", format="%.0f"),
+                "fit_score": st.column_config.ProgressColumn("Fit score", min_value=0, max_value=100, format="%.0f"),
+            })
+        export = shown.drop(columns=["photo"]).assign(
+            identity_source=table["id_source"].replace("", "measured/none")).rename(columns={
+                "rank": "Rank", "player": "Player", "name": "Name", "position": "Position", "team": "Team",
+                "shirt_eff": "Shirt", "pass_pct_demo": "Pass_pct_DEMO", "prog_passes_demo": "Prog_passes_DEMO",
+                "observed_s": "Measured_s", "avg_speed_kmh": "Avg_speed_kmh", "top_speed_kmh": "Top_speed_kmh",
+                "distance_m": "Distance_m", "hi_share": "High_intensity_pct", "press_share": "Pressing_pct",
+                "fit_score": "Fit_score"})
+        st.download_button("📥 Download ranking (CSV)", export.to_csv(index=False), "video_ranking.csv", "text/csv")
 
     # ---------- highlighted video ----------
-    st.markdown("### Highlighted video")
-    highlights = {table.loc[i, "key"]: (i + 1, float(table.loc[i, "fit_score"])) for i in range(top_n)}
-    signature = tuple(sorted(highlights.items()))
-    stale = st.session_state.get("highlight_signature") != signature
-    if stale and (st.session_state.get("highlight_video") is None or
-                  st.button("Update highlighted video for these settings")):
-        with st.spinner("Rendering the highlighted video..."):
-            st.session_state["highlight_video"] = render_highlight_video(analysis, highlights)
-            st.session_state["highlight_signature"] = signature
-    elif stale:
-        st.caption("Your settings changed. Click the button above to refresh the video.")
-    if st.session_state.get("highlight_video"):
-        st.video(st.session_state["highlight_video"])
-        st.download_button("📥 Download highlighted video", st.session_state["highlight_video"],
-                           "highlighted_players.mp4", "video/mp4")
-        st.caption("Gold boxes are the best fits, with their rank and fit score. Grey boxes are other players.")
+    st.markdown("### Highlighted replay")
+    with st.container(border=True):
+        video_col, side_col = st.columns([3, 2], gap="large")
+        with side_col:
+            if len(table) > 1:
+                top_n = st.slider("Highlight the top N players in the video", 1,
+                                  min(10, len(table)), min(3, len(table)))
+            else:
+                top_n = 1
+            ui.render(
+                '<div class="legend"><p><span class="key" style="background:#f5b942"></span>'
+                '<b>Gold boxes</b> are the best fits, with their rank and fit score.</p>'
+                '<p><span class="key" style="background:#aaaaaa"></span><b>Grey boxes</b> are everyone else.</p></div>')
+        highlights = {table.loc[i, "key"]: (i + 1, float(table.loc[i, "fit_score"])) for i in range(top_n)}
+        signature = tuple(sorted(highlights.items()))
+        stale = st.session_state.get("highlight_signature") != signature
+        with video_col:
+            if stale and (st.session_state.get("highlight_video") is None or
+                          st.button("Update highlighted video for these settings")):
+                with st.spinner("Rendering the highlighted video..."):
+                    st.session_state["highlight_video"] = render_highlight_video(analysis, highlights)
+                    st.session_state["highlight_signature"] = signature
+            elif stale:
+                st.caption("Your settings changed. Click the button above to refresh the video.")
+            if st.session_state.get("highlight_video"):
+                st.video(st.session_state["highlight_video"])
+        with side_col:
+            if st.session_state.get("highlight_video"):
+                st.download_button("📥 Download highlighted video", st.session_state["highlight_video"],
+                                   "highlighted_players.mp4", "video/mp4")
 
     # ---------- player report ----------
     st.markdown("### Player report")
@@ -821,27 +888,31 @@ def render_results(analysis, style):
     chosen = st.selectbox("Player", list(labels))
     i = labels[chosen]
     row = table.loc[i]
-    left, right = st.columns([1, 4])
-    with left:
-        if row["key"] in analysis["thumbs"]:
-            st.image(analysis["thumbs"][row["key"]], width=120)
-    with right:
-        who = row["name"] or row["player"]
-        extra = f", {row['position']}" if row["position"] else ""
-        st.markdown(f"**{who}** ({row['team']}{extra}): fit score **{row['fit_score']}** out of 100")
-        if row["id_source"] == "demo":
-            st.caption("Name and position are simulated placeholders (demo mode). The fit score uses only "
-                       "what was measured from the video.")
-        st.write(vm.explain_video(row, pct.loc[i], weights))
-        st.caption("Percentiles compare this player with the other players in this video only.")
-    detail = pd.DataFrame({
-        "Measurement": [vm.VIDEO_LABELS[m] for m in pct.columns],
-        "Importance": [weights[m] for m in pct.columns],
-        "Percentile (100 = best in this video)": pct.loc[i].round(0).astype(int).to_numpy(),
-        "Value": [round(float(row[m]), 1) if pd.notna(row[m]) else None for m in pct.columns],
-    })
-    st.bar_chart(detail.set_index("Measurement")["Percentile (100 = best in this video)"])
-    st.dataframe(detail, width="stretch", hide_index=True)
+    with st.container(border=True):
+        photo_col, info_col = st.columns([1, 4], gap="large")
+        with photo_col:
+            uri = row["photo"] if isinstance(row["photo"], str) else None
+            ui.render(ui.photo(uri, row["player"], big=True))
+        with info_col:
+            who = row["name"] or row["player"]
+            sub = " · ".join(x for x in (row["team"], row["position"], row["player"] if row["name"] else "") if x)
+            ui.render(ui.report_header(who, sub, float(row["fit_score"]), swatches.get(row["team"])))
+            strengths, gaps = vm.strengths_gaps(pct.loc[i], weights)
+            chip_html = ui.chips([f"▲ {label} · {p:.0f}" for label, p in strengths], "good") if strengths else ""
+            chip_html += ui.chips([f"▼ {label} · {p:.0f}" for label, p in gaps], "warn") if gaps else ""
+            if row["observed_s"] < 5:
+                chip_html += ui.chips([f"Measured for only {row['observed_s']:.1f} s"], "neutral")
+            if not strengths and not gaps:
+                chip_html += ui.chips(["No standout strengths or gaps"], "neutral")
+            ui.render(chip_html)
+            if row["id_source"] == "demo":
+                st.caption("Name and position are simulated placeholders (demo mode). The fit score uses only "
+                           "what was measured from the video.")
+        rows = [(vm.VIDEO_LABELS[m], float(pct.loc[i, m]), finite(row[m]),
+                 f"importance {weights[m]:.1f}") for m in pct.columns]
+        ui.render(ui.bars(rows))
+        st.caption("Percentiles compare this player with the other players in this video only. "
+                   "Bar colour: green = strong, blue = middle, amber = weak.")
 
 
 # =====================================================
@@ -856,11 +927,10 @@ def get_competitions():
 
 
 def render_scouting_tab():
-    st.write(
-        "Describe the position and the way your team plays. The app scores every player in the "
-        "dataset against that description and explains the fit. All numbers come from real match "
-        "event data (free StatsBomb Open Data), not from video."
-    )
+    st.markdown(
+        '<p style="color:#b9c8e0;max-width:760px">Describe the position and the way your team plays. The app '
+        'scores every player in the dataset against that description and explains the fit. All numbers come '
+        'from real match event data (free StatsBomb Open Data), not from video.</p>', unsafe_allow_html=True)
     with st.expander("What this can and can't tell you"):
         st.markdown(
             "- **Passing, pressing, carrying and shooting** are counted from real match events.\n"
@@ -880,15 +950,20 @@ def render_scouting_tab():
         return
 
     labels = comps["label"].tolist()
-    chosen = st.multiselect(
-        "Competitions to analyse", labels,
-        default=[l for l in labels if l == "UEFA Euro 2024"],
-        help="Choosing several gives bigger player pools. The first load downloads match data "
-             "(about a second per match) and is then cached on your computer.",
-    )
-    max_matches = st.number_input("Limit number of matches (0 = all)", 0, 1000, 0, step=1)
+    with st.container(border=True):
+        st.markdown("##### 1 · Choose the data")
+        col_a, col_b = st.columns([3, 1], gap="large")
+        with col_a:
+            chosen = st.multiselect(
+                "Competitions to analyse", labels,
+                default=[l for l in labels if l == "UEFA Euro 2024"],
+                help="Choosing several gives bigger player pools. The first load downloads match data "
+                     "(about a second per match) and is then cached on your computer.")
+        with col_b:
+            max_matches = st.number_input("Limit matches (0 = all)", 0, 1000, 0, step=1)
+        load = st.button("Load player data", type="primary", disabled=not chosen)
 
-    if st.button("Load player data", disabled=not chosen):
+    if load:
         picked = comps[comps["label"].isin(chosen)]
         selections = list(zip(picked["competition_id"], picked["season_id"]))
         bar = st.progress(0.0, text="Starting...")
@@ -899,6 +974,7 @@ def render_scouting_tab():
             )
             st.session_state["profiles"] = profiles
             st.session_state["skipped"] = skipped
+            st.session_state["competitions_loaded"] = len(chosen)
         except Exception as e:
             st.error(f"Could not download match data: {e}")
         bar.empty()
@@ -910,30 +986,38 @@ def render_scouting_tab():
     if profiles.empty:
         st.warning("No player data was loaded.")
         return
-    note = f" ({st.session_state['skipped']} matches could not be read)" if st.session_state.get("skipped") else ""
-    st.success(f"Loaded {len(profiles)} players{note}.")
+    ui.render(ui.tiles([
+        (len(profiles), "players loaded"),
+        (profiles["team"].nunique(), "teams"),
+        (st.session_state.get("competitions_loaded", len(chosen)),
+         "competition" if st.session_state.get("competitions_loaded", len(chosen)) == 1 else "competitions"),
+        (int(profiles["matches"].max()), "most matches by one player"),
+    ]))
+    if st.session_state.get("skipped"):
+        st.caption(f"{st.session_state['skipped']} matches could not be read.")
 
     # ---------- 2. requirements ----------
-    st.markdown("### Your requirements")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        group = st.selectbox("Position you are recruiting for", scouting.POSITION_GROUPS, index=5)
-    with c2:
-        style = st.selectbox("How does your team play?", list(scouting.STYLE_WEIGHTS))
-    with c3:
-        min_minutes = st.slider("Minimum minutes played", 0, 900, 180, step=30)
+    with st.container(border=True):
+        st.markdown("##### 2 · Your requirements")
+        c1, c2, c3 = st.columns(3, gap="large")
+        with c1:
+            group = st.selectbox("Position you are recruiting for", scouting.POSITION_GROUPS, index=5)
+        with c2:
+            style = st.selectbox("How does your team play?", list(scouting.STYLE_WEIGHTS))
+        with c3:
+            min_minutes = st.slider("Minimum minutes played", 0, 900, 180, step=30)
 
-    base = scouting.default_weights(group, style)
-    metric_keys = list(scouting.RATE_METRICS) + list(scouting.OTHER_METRICS)
-    weights = {}
-    with st.expander("Fine-tune what matters (-1 = lower is better, 0 = ignore, 1 = very important)"):
-        cols = st.columns(2)
-        for i, metric in enumerate(metric_keys):
-            with cols[i % 2]:
-                weights[metric] = st.slider(
-                    scouting.METRIC_LABELS[metric], -1.0, 1.0, float(base.get(metric, 0.0)), 0.1,
-                    key=f"w_{group}_{style}_{metric}", help=scouting.METRIC_HELP[metric],
-                )
+        base = scouting.default_weights(group, style)
+        metric_keys = list(scouting.RATE_METRICS) + list(scouting.OTHER_METRICS)
+        weights = {}
+        with st.expander("Fine-tune what matters (-1 = lower is better, 0 = ignore, 1 = very important)"):
+            cols = st.columns(2)
+            for i, metric in enumerate(metric_keys):
+                with cols[i % 2]:
+                    weights[metric] = st.slider(
+                        scouting.METRIC_LABELS[metric], -1.0, 1.0, float(base.get(metric, 0.0)), 0.1,
+                        key=f"w_{group}_{style}_{metric}", help=scouting.METRIC_HELP[metric],
+                    )
 
     # ---------- 3. results ----------
     table, pct, raw = scouting.fit_scores(profiles, group, weights, min_minutes)
@@ -943,36 +1027,59 @@ def render_scouting_tab():
     if len(table) < 8:
         st.warning(f"Only {len(table)} players are in this comparison group, so percentiles are rough.")
 
-    st.markdown(f"### Best fits: {group.lower()}s for a {style.lower()} team")
-    top_n = st.slider("Players to show", 5, 50, min(15, len(table)))
+    st.markdown(f"### Top picks · {group.lower()}s for a {style.lower()} team")
+    lead = max((m for m in weights if weights[m] != 0 and m in raw.columns), key=lambda m: weights[m], default=None)
+    cards = []
+    for i in range(min(3, len(table))):
+        r = table.iloc[i]
+        stats = [(f"{int(r['minutes'])}", "minutes")]
+        if lead:
+            stats.append((finite(raw.loc[i, lead], "{:.1f}"), scouting.METRIC_LABELS[lead].lower() + "/90"
+                          if lead.endswith("_p90") else scouting.METRIC_LABELS[lead].lower()))
+        cards.append({"title": r["player"], "sub": " · ".join(x for x in (r["team"], r["position"]) if x),
+                      "photo_uri": None, "fallback": ui.initials(r["player"]),
+                      "score": float(r["fit_score"]), "stats": stats})
+    ui.render(ui.picks(cards))
+
+    top_n = st.slider("Players to show", 5, 50, min(15, len(table))) if len(table) > 5 else len(table)
     shown = table.head(top_n).rename(columns={
         "player": "Player", "team": "Team", "position": "Position",
         "minutes": "Minutes", "fit_score": "Fit score (0-100)"})
-    st.dataframe(shown, width="stretch", hide_index=True)
-    st.download_button("📥 Download shortlist (CSV)", shown.to_csv(index=False), "shortlist.csv", "text/csv")
+    with st.expander("Full shortlist and export", expanded=True):
+        st.dataframe(shown, width="stretch", hide_index=True, column_config={
+            "Fit score (0-100)": st.column_config.ProgressColumn(
+                "Fit score (0-100)", min_value=0, max_value=100, format="%.0f")})
+        st.download_button("📥 Download shortlist (CSV)", shown.to_csv(index=False), "shortlist.csv", "text/csv")
 
     st.markdown("### Player report")
     name = st.selectbox("Player", shown["Player"].tolist())
     i = int(table.index[table["player"] == name][0])
-    st.markdown(f"**{name}** ({table.loc[i, 'team']}): fit score **{table.loc[i, 'fit_score']}** out of 100")
-    st.write(scouting.explain(table.loc[i], pct.loc[i], weights))
-
-    detail = pd.DataFrame({
-        "Metric": [scouting.METRIC_LABELS[m] for m in pct.columns],
-        "Importance": [weights[m] for m in pct.columns],
-        "Percentile (100 = best among peers)": pct.loc[i].round(0).astype(int).to_numpy(),
-        "Value": raw.loc[i].round(2).to_numpy(),
-    })
-    st.bar_chart(detail.set_index("Metric")["Percentile (100 = best among peers)"])
-    st.dataframe(detail, width="stretch", hide_index=True)
+    with st.container(border=True):
+        sub = " · ".join(x for x in (table.loc[i, "team"], table.loc[i, "position"],
+                                     f"{int(table.loc[i, 'minutes'])} minutes") if x)
+        ui.render(ui.report_header(name, sub, float(table.loc[i, "fit_score"])))
+        strengths, gaps = vm.strengths_gaps(pct.loc[i], weights, labels=scouting.METRIC_LABELS, min_gap_weight=0.3)
+        chip_html = ui.chips([f"▲ {label} · {p:.0f}" for label, p in strengths], "good") if strengths else ""
+        chip_html += ui.chips([f"▼ {label} · {p:.0f}" for label, p in gaps], "warn") if gaps else ""
+        if table.loc[i, "minutes"] < 450:
+            chip_html += ui.chips([f"Small sample · {int(table.loc[i, 'minutes'])} minutes"], "neutral")
+        if not strengths and not gaps:
+            chip_html += ui.chips(["No standout strengths or gaps"], "neutral")
+        ui.render(chip_html)
+        rows = [(scouting.METRIC_LABELS[m], float(pct.loc[i, m]), finite(raw.loc[i, m], "{:.2f}"),
+                 f"importance {weights[m]:+.1f}") for m in pct.columns]
+        ui.render(ui.bars(rows))
+        st.caption("Percentiles compare this player with others in the same position group. "
+                   "Bar colour: green = strong, blue = middle, amber = weak.")
 
 
 # =====================================================
 # MAIN APP
 # =====================================================
 def main():
-    st.set_page_config(page_title="⚽ Player Scouting", layout="wide")
-    st.title("⚽ Player Scouting & Tracking")
+    st.set_page_config(page_title="Player Scouting", page_icon="⚽", layout="wide")
+    ui.inject_css()
+    ui.render(ui.hero())
 
     video_tab, scouting_tab = st.tabs(["🎥 Analyse a video", "📊 Data scouting"])
     with video_tab:

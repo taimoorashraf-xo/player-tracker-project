@@ -211,23 +211,30 @@ def rank_candidates(df, weights):
     return table.loc[order].reset_index(drop=True), pct.loc[order].reset_index(drop=True)
 
 
-def explain_video(row, pct_row, weights):
-    """Plain-language reason for a candidate's score."""
+def strengths_gaps(pct_row, weights, labels=None, min_gap_weight=0.5):
+    """What a player is good at and weak in, as lists of (label, percentile)."""
+    labels = labels or VIDEO_LABELS
     important = {m: w for m, w in weights.items() if w != 0 and m in pct_row.index}
     by_value = sorted(important, key=lambda m: abs(important[m]) * pct_row[m], reverse=True)
-    strengths = [m for m in by_value if pct_row[m] >= 70][:3]
+    strengths = [(labels[m], pct_row[m]) for m in by_value if pct_row[m] >= 70][:3]
     by_need = sorted(important, key=lambda m: abs(important[m]), reverse=True)
-    gaps = [m for m in by_need if pct_row[m] <= 35 and abs(important[m]) >= 0.5][:2]
+    gaps = [(labels[m], pct_row[m]) for m in by_need
+            if pct_row[m] <= 35 and abs(important[m]) >= min_gap_weight][:2]
+    return strengths, gaps
 
+
+def explain_video(row, pct_row, weights):
+    """Plain-language reason for a candidate's score."""
+    strengths, gaps = strengths_gaps(pct_row, weights)
     parts = []
     if strengths:
         parts.append("Stands out in: " + ", ".join(
-            f"{VIDEO_LABELS[m].lower()} (percentile {int(round(pct_row[m]))})" for m in strengths) + ".")
+            f"{label.lower()} (percentile {int(round(p))})" for label, p in strengths) + ".")
     else:
         parts.append("No standout strengths against these requirements.")
     if gaps:
         parts.append("Weaker in: " + ", ".join(
-            f"{VIDEO_LABELS[m].lower()} (percentile {int(round(pct_row[m]))})" for m in gaps) + ".")
+            f"{label.lower()} (percentile {int(round(p))})" for label, p in gaps) + ".")
     if row["observed_s"] < 5:
         parts.append(f"Only measured for {row['observed_s']:.1f} s, so treat this with caution.")
     return " ".join(parts)
