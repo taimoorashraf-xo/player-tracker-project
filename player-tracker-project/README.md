@@ -75,7 +75,9 @@ pip install -r requirements.txt
 
 ### 3. Run Application
 
-Run from the same folder (the model file `yolov8m.pt` is loaded from the script's folder):
+**Easiest:** from the top-level repository folder, run `.\start.bat` (Windows PowerShell) or `./start.sh` (Mac/Linux). It starts the app from the right folder.
+
+**Or manually,** from the folder that contains `player_tracker_final.py`:
 
 ```bash
 streamlit run player_tracker_final.py
