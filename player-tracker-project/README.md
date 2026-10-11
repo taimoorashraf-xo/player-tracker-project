@@ -31,14 +31,41 @@ Highlights alone cannot tell the app who a player is, or what position they play
 - **Your own input:** open "Edit names, positions and shirt numbers" and type them in. The **Position needed** filter then ranks only players tagged with that position (for example a right winger).
 - **Demo mode:** one checkbox fills in simulated names, positions, shirt numbers and passing figures, so the whole flow can be shown on any clip. Everything simulated is labelled **(demo)**, appears in separate demo columns, is marked in the CSV, and **never changes the fit score**. If you present results from demo mode, say that those details are placeholders.
 
-## Data scouting tab
+## Data scouting tab (team-aware)
 
-A second tab ranks players using real match event data instead of video. Pick a position and a playing style (high press, possession build-up, counter-attack or balanced), and the app scores every player in the data against it and explains the fit.
+A good scout does not ask "who is the best winger?" but "who is the best winger **for how we play**, and would he improve what we already have?". This tab works that way, using real match event data.
+
+1. **Pick your team.** Choose a team from the data, and the app reads its **formation** (from the real starting line-ups) and its **playstyle** (pressing intensity, possession, directness, use of the wings, defensive line height and counter-attacks, each compared with the other teams). If your team is not in the data, **describe it by hand** with a formation and three sliders.
+2. **See the squad needs.** For each position the formation uses, the app finds the current starter, judges him on *this* system, and shows where he ranks among all players in the data. The weakest position is selected for you automatically.
+3. **Rank candidates for that position.** The fit score combines the **role** (what the position does in your formation; for example wing-backs in a back three are judged more on crossing and carrying) and the **style** (what your way of playing asks for, blended from your team's real style). Each candidate shows his role fit, style fit and **how much better or worse he is than your current starter** ("Clear upgrade", "Marginal upgrade" or "Not an upgrade"). Your own players are left out.
 
 - **Data:** free [StatsBomb Open Data](https://github.com/statsbomb/open-data) (selected men's competitions, including UEFA Euro 2020 and 2024). It downloads on first use (about a second per match), is cached in `data_cache/`, and needs an internet connection the first time.
-- **Metrics (per 90 minutes):** passing (volume, completion, progressive, key, into the final third, long, crosses), pressing and defending, ball carrying, shooting, ball losses and average position.
-- **Scoring:** percentiles within the same position group, weighted by the position and style. Every weight can be changed.
-- **Limits:** event data has no distance run or sprint speed, so work rate and pace are proxies. A few matches means a small sample. Treat the result as a shortlist to watch.
+- **Player metrics (per 90 minutes):** passing, pressing and defending, ball carrying, shooting, ball losses and average position.
+- **Scoring:** percentiles within the same position group, weighted by the position, the formation and the team's playstyle. Every weight can be changed.
+
+### Edge cases the tab handles
+
+| Situation | What happens |
+|---|---|
+| Your team is not in the data | Describe it by hand; you still get the style-aware ranking, without the squad analysis |
+| The team used several formations | The most common one is used, and the others are listed |
+| The team has played only a few matches | A warning says the playstyle estimate is rough |
+| The formation has no slot for the position you chose (for example a winger in a 3-5-2) | A warning appears |
+| The team has no qualifying starter in that position | The need is shown as high and no starter comparison is made |
+| Players from your own team | Excluded from the candidates |
+| Players who play several positions | Optional "can also play this position" setting; versatile players are labelled |
+| Players with few minutes | Scores are pulled towards average (small-sample adjustment), and every player has a High / Medium / Low sample label |
+| Older matches without pressing, carrying or xG data | Shown as n/a and counted as average, never as zero; mixing them in does not dilute other matches |
+| Several competitions loaded | Players are compared across leagues of different strength, and this is disclosed |
+| Goalkeepers | Not scored, because event metrics do not capture their job |
+
+### Not handled yet
+
+- Age, contract, cost, injuries and work permits (not in event data).
+- Strength of the opposition a player faced, and match situations such as leading or trailing.
+- Finer roles within a position (for example inverted versus traditional winger).
+- Players who moved clubs mid-season are listed under their last team.
+- Work rate and pace are proxies; event data has no distance run or sprint speed.
 
 ## Requirements
 
@@ -108,8 +135,9 @@ Tips: shots that follow play for several seconds give the best measurements. Ver
 ### Data scouting
 
 1. Open the **📊 Data scouting** tab, choose competitions and click **Load player data**.
-2. Choose the position, the way your team plays, and a minimum number of minutes.
-3. Read the ranked shortlist and pick a player for the fit report. Download the shortlist as CSV.
+2. Choose your team from the data (or describe it by hand) and read its formation, playstyle and squad needs.
+3. Choose the position (your biggest need is pre-selected) and whether to scout for your team's playstyle or a different one.
+4. Read the ranked shortlist, tick **Only show players who would improve on the current starter** if you like, and pick a player for the fit report. Download the shortlist as CSV.
 
 ## Troubleshooting
 
@@ -147,6 +175,7 @@ player-tracker-project/
 ├── player_tracker_final.py    (Main app: both tabs, detection and tracking)
 ├── video_metrics.py            (Speed, pressing, team grouping and ranking from video)
 ├── scouting.py                 (Data scouting metrics and fit scoring)
+├── team_context.py             (Team formation, playstyle, squad needs and upgrade logic)
 ├── demo_data.py                (Clearly labelled simulated placeholders for demos)
 ├── ui_theme.py                 (Design system: theme CSS and HTML components)
 ├── .streamlit/config.toml      (Dark theme; start the app from this folder so it is picked up)

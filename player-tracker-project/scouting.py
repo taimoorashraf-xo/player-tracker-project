@@ -5,6 +5,7 @@ off-the-ball activity numbers. It does NOT contain distance run or sprint speed 
 needs tracking data), so work rate and pace are expressed through event-based proxies.
 """
 import os
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -101,6 +102,19 @@ def position_group(position):
     if "Forward" in position or "Striker" in position:
         return "Forward"
     return "Other"
+
+
+ALL_GROUPS = POSITION_GROUPS + ["Goalkeeper", "Other"]
+GROUP_MIN_COLS = [f"min_{g}" for g in ALL_GROUPS]            # minutes played in each position group
+COVERAGE_COLS = ["min_pressure_data", "min_xg_data", "min_carry_data"]   # minutes from matches that record each stat
+EXTRA_SUM_COLS = ["minutes"] + GROUP_MIN_COLS + COVERAGE_COLS
+# Which minutes a per-90 rate should be divided by, so matches without that data are not counted as zeros
+COVERAGE_FOR = {"pressures": "min_pressure_data", "counterpresses": "min_pressure_data", "xg": "min_xg_data",
+                "carries": "min_carry_data", "prog_carries": "min_carry_data", "carry_dist": "min_carry_data"}
+CACHE_VERSION = "v2"
+VERSATILE_MIN_SHARE = 0.25     # share of minutes in a group for a player to count as able to play there
+VERSATILE_MIN_MINUTES = 90
+SMALL_SAMPLE_MINUTES = 120     # trust in a player's per-90 numbers = minutes / (minutes + this)
 
 
 def default_weights(group, style):
@@ -219,7 +233,98 @@ def match_player_stats(ev):
     first_last = d.groupby("player_id")["minute"].agg(["min", "max"])
     fallback = (first_last["max"] - first_last["min"]).clip(lower=1.0)
     out["minutes"] = [minutes.get(pid, fallback[pid]) for pid in out.index]
+
+    # Minutes in this match are credited to the position group the player mostly occupied
+    group_now = out["position"].map(position_group)
+    for g in ALL_GROUPS:
+        out[f"min_{g}"] = np.where(group_now == g, out["minutes"], 0.0)
+
+    # Older matches record fewer event types; remember which stats this match actually has
+    has_pressure = bool(typ.eq("Pressure").any())
+    has_xg = bool(_col(d, "shot_statsbomb_xg").notna().any())
+    has_carry = bool(is_carry.any())
+    out["min_pressure_data"] = out["minutes"] * has_pressure
+    out["min_xg_data"] = out["minutes"] * has_xg
+    out["min_carry_data"] = out["minutes"] * has_carry
     return out
+
+
+# =====================================================
+# EVENTS -> PER-MATCH TEAM STATS (formation and way of playing)
+# =====================================================
+TEAM_SUM_COLS = ["passes", "pass_ok", "opp_passes", "opp_passes_build", "def_actions_high", "pressures",
+                 "pressures_high", "long_passes", "prog_passes", "final_third_entries", "wide_actions",
+                 "pass_carry_starts", "def_line_sum_x", "def_line_n", "shots", "counter_shots"]
+SLOT_GROUPS = POSITION_GROUPS + ["Goalkeeper"]
+
+
+def format_formation(value):
+    """3412 -> '3-4-1-2'."""
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    return "-".join(digits)
+
+
+def match_team_stats(ev):
+    """Formation, starting positions and playing-style counts for both teams in one match."""
+    d = ev[ev["team"].notna()].copy()
+    teams = list(d["team"].unique())
+    if len(teams) < 2:
+        return pd.DataFrame()
+
+    x, y = _xy(_col(d, "location"))
+    ex, _ = _xy(_col(d, "pass_end_location"))
+    x, y, ex = (pd.Series(a, index=d.index) for a in (x, y, ex))
+    typ = d["type"]
+    is_pass = typ.eq("Pass")
+    pass_ok = is_pass & _col(d, "pass_outcome").isna()
+    is_carry = typ.eq("Carry")
+    is_shot = typ.eq("Shot")
+    tackle = typ.eq("Duel") & _col(d, "duel_type").eq("Tackle")
+    interception = typ.eq("Interception")
+    foul = typ.eq("Foul Committed")
+    pressure = typ.eq("Pressure")
+    defending = (tackle | interception | pressure) & x.notna()
+    start = (is_pass | is_carry) & x.notna()
+
+    f = pd.DataFrame({"team": d["team"]}, index=d.index)
+    f["passes"] = is_pass
+    f["pass_ok"] = pass_ok
+    f["pressures"] = pressure
+    f["pressures_high"] = pressure & (x >= 60)
+    f["def_actions_high"] = (tackle | interception | foul) & (x >= 48)
+    f["long_passes"] = is_pass & (_col(d, "pass_length") >= 30)
+    f["prog_passes"] = pass_ok & ((ex - x) >= 10)
+    f["final_third_entries"] = pass_ok & (ex >= 80) & (x < 80)
+    f["pass_carry_starts"] = start
+    f["wide_actions"] = start & ((y < 20) | (y > 60))
+    f["def_line_sum_x"] = np.where(defending, x, 0.0)
+    f["def_line_n"] = defending
+    f["shots"] = is_shot
+    f["counter_shots"] = is_shot & _col(d, "play_pattern").eq("From Counter")
+    own = f.groupby("team")[[c for c in TEAM_SUM_COLS if c not in ("opp_passes", "opp_passes_build")]].sum().astype(float)
+
+    # What each team's opponent did: how many passes they made, and how many while building from deep
+    total_passes = f.groupby("team")["passes"].sum()
+    build_passes = (is_pass & (x <= 72)).groupby(d["team"]).sum()
+    other = {t: [o for o in teams if o != t][0] for t in teams}
+    own["opp_passes"] = [float(total_passes.get(other[t], 0)) for t in own.index]
+    own["opp_passes_build"] = [float(build_passes.get(other[t], 0)) for t in own.index]
+
+    # Starting formation and how many starters fill each position group
+    own["formation"] = ""
+    for g in SLOT_GROUPS:
+        own[f"slot_{g}"] = 0.0
+    for _, row in ev[ev["type"] == "Starting XI"].iterrows():
+        tactics = row.get("tactics")
+        team = row.get("team")
+        if isinstance(tactics, dict) and team in own.index:
+            own.loc[team, "formation"] = format_formation(tactics.get("formation", ""))
+            for entry in tactics.get("lineup", []):
+                g = position_group(entry["position"]["name"])
+                if g in SLOT_GROUPS:
+                    own.loc[team, f"slot_{g}"] += 1
+    own["matches"] = 1.0
+    return own
 
 
 # =====================================================
@@ -234,16 +339,19 @@ def list_competitions():
     return comps.sort_values("label").reset_index(drop=True)
 
 
-def fetch_match_stats(match_id, cache_dir):
-    """Per-player stats for one match, downloaded once and then read from disk."""
-    path = os.path.join(cache_dir, f"{int(match_id)}.pkl")
-    if os.path.exists(path):
-        return pd.read_pickle(path)
+def fetch_match(match_id, cache_dir):
+    """(player stats, team stats) for one match, downloaded once and then read from disk."""
+    base = os.path.join(cache_dir, f"{CACHE_VERSION}_{int(match_id)}")
+    players_path, teams_path = base + "_players.pkl", base + "_teams.pkl"
+    if os.path.exists(players_path) and os.path.exists(teams_path):
+        return pd.read_pickle(players_path), pd.read_pickle(teams_path)
     from statsbombpy import sb
-    stats = match_player_stats(sb.events(match_id=int(match_id)))
+    ev = sb.events(match_id=int(match_id))
+    players, teams = match_player_stats(ev), match_team_stats(ev)
     os.makedirs(cache_dir, exist_ok=True)
-    stats.to_pickle(path)
-    return stats
+    players.to_pickle(players_path)
+    teams.to_pickle(teams_path)
+    return players, teams
 
 
 def match_ids_for(selections):
@@ -262,57 +370,115 @@ def aggregate(frames):
     if not frames:
         return pd.DataFrame()
     allf = pd.concat(frames)
-    sums = allf.groupby(level=0)[SUM_COLS + ["minutes"]].sum()
+    sums = allf.groupby(level=0)[SUM_COLS + EXTRA_SUM_COLS].sum()
     meta = allf.groupby(level=0).agg(
         player=("player", "last"), team=("team", "last"), position=("position", _mode),
         matches=("minutes", "size"))
     return meta.join(sums)
 
 
+def aggregate_teams(frames):
+    """Combine per-match team stats into one row per team, with derived style metrics."""
+    frames = [f for f in frames if f is not None and not f.empty]
+    if not frames:
+        return pd.DataFrame()
+    allf = pd.concat(frames)
+    slot_cols = [f"slot_{g}" for g in SLOT_GROUPS]
+    teams = allf.groupby(level=0)[TEAM_SUM_COLS + slot_cols + ["matches"]].sum()
+    teams["formations"] = allf.groupby(level=0)["formation"].agg(
+        lambda s: Counter([v for v in s if v]).most_common())
+    teams["main_formation"] = teams["formations"].map(lambda fl: fl[0][0] if fl else "")
+    teams["formation_share"] = teams["formations"].map(
+        lambda fl: fl[0][1] / sum(c for _, c in fl) if fl else 0.0)
+
+    one = lambda col: teams[col].clip(lower=1)
+    teams["possession_pct"] = teams["passes"] / (teams["passes"] + teams["opp_passes"]).clip(lower=1) * 100
+    teams["ppda"] = teams["opp_passes_build"] / one("def_actions_high")
+    teams["high_press_share"] = teams["pressures_high"] / one("pressures") * 100
+    teams["long_pass_share"] = teams["long_passes"] / one("passes") * 100
+    teams["prog_pass_share"] = teams["prog_passes"] / one("passes") * 100
+    teams["wide_share"] = teams["wide_actions"] / one("pass_carry_starts") * 100
+    teams["def_line_x"] = teams["def_line_sum_x"] / one("def_line_n")
+    teams["counter_share"] = teams["counter_shots"] / one("shots") * 100
+    for g in SLOT_GROUPS:
+        teams[f"slots_{g}"] = teams[f"slot_{g}"] / teams["matches"]
+    return teams
+
+
 def build_profiles(agg):
-    """Per-90 rates and the other metrics, plus each player's position group."""
+    """Per-90 rates and the other metrics, position groups, versatility and reliability."""
     p = agg[agg["minutes"] > 0].copy()
-    per90 = 90.0 / p["minutes"]
+    p["player_id"] = p.index
     for key, (_, _, col) in RATE_METRICS.items():
-        p[key] = p[col] * per90
+        denominator = p[COVERAGE_FOR.get(col, "minutes")]
+        p[key] = np.where(denominator > 0, p[col] * 90.0 / denominator.where(denominator > 0, 1.0), np.nan)
     p["pass_pct"] = np.where(p["passes"] > 0, p["pass_ok"] / p["passes"].clip(lower=1) * 100, np.nan)
     p["avg_x"] = np.where(p["n_loc"] > 0, p["sum_x"] / p["n_loc"].clip(lower=1), np.nan)
-    p["position_group"] = p["position"].map(position_group)
-    keep = ["player", "team", "position", "position_group", "matches", "minutes"] + \
-           list(RATE_METRICS) + list(OTHER_METRICS)
+
+    # Position group comes from where the player actually spent their minutes
+    minutes_by_group = p[GROUP_MIN_COLS].rename(columns=lambda c: c[len("min_"):])
+    p["position_group"] = minutes_by_group.idxmax(axis=1)
+    share = minutes_by_group.div(p["minutes"], axis=0)
+    p["groups_played"] = [
+        tuple(g for g in POSITION_GROUPS
+              if share.loc[i, g] >= VERSATILE_MIN_SHARE and minutes_by_group.loc[i, g] >= VERSATILE_MIN_MINUTES)
+        for i in p.index]
+
+    p["reliability"] = np.select([p["minutes"] >= 600, p["minutes"] >= 270], ["High", "Medium"], "Low")
+    notes = []
+    for _, r in p.iterrows():
+        missing = [label for col, label in (("min_pressure_data", "pressing"), ("min_xg_data", "xG"),
+                                            ("min_carry_data", "ball carrying")) if r[col] <= 0]
+        notes.append(", ".join(missing))
+    p["missing_data"] = notes
+
+    keep = ["player_id", "player", "team", "position", "position_group", "groups_played", "matches", "minutes",
+            "reliability", "missing_data"] + list(RATE_METRICS) + list(OTHER_METRICS)
     return p[keep].reset_index(drop=True)
 
 
 def build_dataset(selections, cache_dir, max_matches=None, progress=None):
-    """Download (or read from cache) the matches and return (profiles, skipped_matches)."""
+    """Download (or read from cache) the matches. Returns {"profiles", "teams", "skipped"}."""
     ids = match_ids_for(selections)
     if max_matches:
         ids = ids[:max_matches]
-    frames, skipped = [], 0
+    player_frames, team_frames, skipped = [], [], 0
     for i, mid in enumerate(ids, start=1):
         try:
-            frames.append(fetch_match_stats(mid, cache_dir))
+            players, teams = fetch_match(mid, cache_dir)
+            player_frames.append(players)
+            team_frames.append(teams)
         except Exception:
             skipped += 1
         if progress:
             progress(i, len(ids))
-    agg = aggregate(frames)
-    return (build_profiles(agg) if not agg.empty else pd.DataFrame()), skipped
+    agg = aggregate(player_frames)
+    return {
+        "profiles": build_profiles(agg) if not agg.empty else pd.DataFrame(),
+        "teams": aggregate_teams(team_frames),
+        "skipped": skipped,
+    }
 
 
 # =====================================================
 # FIT SCORING
 # =====================================================
-def fit_scores(profiles, group, weights, min_minutes):
+def fit_scores(profiles, group, weights, min_minutes, include_versatile=False, small_sample_adjust=False):
     """Score every player in the position group against the requirements.
 
     Each metric is turned into a percentile among players in the same position group
     (flipped when the weight is negative), and the score is the weighted average, 0-100.
+    include_versatile also ranks players who spent a real share of their minutes in this
+    group without it being their main position. small_sample_adjust pulls scores of players
+    with few minutes towards 50, so a brilliant 90 minutes does not outrank a proven player.
     Returns (ranked table, per-metric adjusted percentiles, per-metric raw values), all in
     the same row order, or three empty frames.
     """
     weights = {m: w for m, w in weights.items() if w != 0 and m in profiles.columns}
-    pool = profiles[(profiles["position_group"] == group) & (profiles["minutes"] >= min_minutes)].copy()
+    in_group = profiles["position_group"] == group
+    if include_versatile:
+        in_group = in_group | profiles["groups_played"].map(lambda g: group in g)
+    pool = profiles[in_group & (profiles["minutes"] >= min_minutes)].copy()
     if pool.empty or not weights:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     pool = pool.reset_index(drop=True)
@@ -326,9 +492,15 @@ def fit_scores(profiles, group, weights, min_minutes):
     total = sum(abs(w) for w in weights.values())
     score = sum(pct[m] * abs(w) for m, w in weights.items()) / total
 
-    table = pool[["player", "team", "position", "minutes"]].copy()
+    table = pool[["player_id", "player", "team", "position", "position_group", "groups_played",
+                  "minutes", "reliability", "missing_data"]].copy()
     table["minutes"] = table["minutes"].round(0).astype(int)
-    table["fit_score"] = score.round(1)
+    table["raw_score"] = score.round(1)
+    if small_sample_adjust:
+        trust = pool["minutes"] / (pool["minutes"] + SMALL_SAMPLE_MINUTES)
+        table["fit_score"] = (50 + (score - 50) * trust).round(1)
+    else:
+        table["fit_score"] = table["raw_score"]
     order = table["fit_score"].sort_values(ascending=False).index
     raw = pool[list(weights)]
     return (table.loc[order].reset_index(drop=True), pct.loc[order].reset_index(drop=True),

@@ -14,6 +14,7 @@ from ultralytics import YOLO
 
 import demo_data
 import scouting
+import team_context as tc
 import ui_theme as ui
 import video_metrics as vm
 
@@ -926,20 +927,95 @@ def get_competitions():
     return scouting.list_competitions()
 
 
+def team_card(teams):
+    """Pick a team from the data or describe your own. Returns the team context, or None."""
+    with st.container(border=True):
+        st.markdown("##### 2 · Your team")
+        mode = st.radio("Which team are you scouting for?", ["A team from the data", "Describe my own team"],
+                        horizontal=True, label_visibility="collapsed", key="team_mode")
+        if mode == "A team from the data" and not teams.empty:
+            name = st.selectbox("Team", sorted(teams.index), key="team_name",
+                                help="Its formation and way of playing are measured from its real matches in the data.")
+            row = teams.loc[name]
+            formation = row["main_formation"] or "4-3-3"
+            scores = tc.style_scores_from_team(row, teams)
+            slots = {g: float(row[f"slots_{g}"]) for g in scouting.SLOT_GROUPS}
+            used = ", ".join(f"{f} ×{c}" for f, c in row["formations"]) or "unknown"
+            ui.render(ui.tiles([
+                (formation, "usual formation"), (f"{int(row['matches'])}", "matches analysed"),
+                (tc.style_label(scores), "how they play"), (f"{row['possession_pct']:.0f}%", "possession")]))
+            if row["matches"] < 3:
+                st.warning(f"Only {int(row['matches'])} match(es) for this team, so the playstyle estimate is rough.")
+            if len(row["formations"]) > 1:
+                st.caption(f"Formations used: {used}. The most common one is used for the analysis.")
+            facts = [
+                ("Possession", tc._percentile(teams["possession_pct"], row["possession_pct"]), f"{row['possession_pct']:.0f}%", "share of all passes"),
+                ("Pressing intensity", tc._percentile(teams["ppda"], row["ppda"], False), f"PPDA {row['ppda']:.1f}", "opponent passes per defensive action; lower = presses harder"),
+                ("Press height", tc._percentile(teams["high_press_share"], row["high_press_share"]), f"{row['high_press_share']:.0f}%", "of pressures in the opponent's half"),
+                ("Directness", tc._percentile(teams["long_pass_share"], row["long_pass_share"]), f"{row['long_pass_share']:.0f}%", "of passes are long"),
+                ("Use of the wings", tc._percentile(teams["wide_share"], row["wide_share"]), f"{row['wide_share']:.0f}%", "of passes and carries start wide"),
+                ("Defensive line", tc._percentile(teams["def_line_x"], row["def_line_x"]), f"{row['def_line_x']:.0f} / 120", "average height of defensive actions"),
+                ("Counter-attacks", tc._percentile(teams["counter_share"], row["counter_share"]), f"{row['counter_share']:.0f}%", "of shots come from counters"),
+            ]
+            with st.expander("How this team plays, compared with the other teams in the data"):
+                ui.render(ui.bars(facts))
+            return {"source": "data", "name": name, "formation": formation, "scores": scores, "slots": slots,
+                    "label": tc.style_label(scores)}
+
+        c1, c2 = st.columns([1, 2], gap="large")
+        with c1:
+            formation = st.selectbox("Formation", tc.FORMATIONS, index=1, key="custom_formation")
+        with c2:
+            press = st.slider("Pressing", 0, 100, 50, key="custom_press", help="0 = sits deep, 100 = presses high and hard")
+            poss = st.slider("Possession", 0, 100, 50, key="custom_poss", help="0 = happy without the ball, 100 = dominates the ball")
+            direct = st.slider("Directness and counter-attacks", 0, 100, 50, key="custom_direct",
+                               help="0 = patient build-up, 100 = quick, direct attacks")
+        scores = tc.style_scores_custom(press, poss, direct)
+        st.caption("Your own team is described by hand, so there is no squad analysis. "
+                   "Candidates are still scored against this formation and style.")
+        return {"source": "custom", "name": None, "formation": formation, "scores": scores,
+                "slots": tc.slots_for_formation(formation), "label": tc.style_label(scores)}
+
+
+def squad_needs(overview):
+    """Show who starts in each position and where the team is weakest."""
+    used = overview[overview["in_use"]].sort_values("need", ascending=False)
+    if used.empty:
+        return None
+    rows = []
+    for _, r in used.iterrows():
+        who = r["starter"] or "no qualifying player"
+        rows.append((r["group"], float(r["standing"]) if r["standing"] is not None and pd.notna(r["standing"]) else 0.0,
+                     r["rank"] or "–", f"{who} · {r['verdict']}"))
+    top = used.iloc[0]
+    with st.container(border=True):
+        st.markdown("##### Squad needs: how the current starters compare for this system")
+        ui.render(ui.note(f"Biggest need: {top['group'].lower()}. "
+                          f"Current starter: {top['starter'] or 'none with enough minutes'}."))
+        ui.render(ui.bars(rows))
+        st.caption("Bars show where each starter ranks among all players in the data at that position, judged on "
+                   "your team's formation and playstyle. Shorter bar = bigger need.")
+    return top["group"]
+
+
 def render_scouting_tab():
     st.markdown(
-        '<p style="color:#b9c8e0;max-width:760px">Describe the position and the way your team plays. The app '
-        'scores every player in the dataset against that description and explains the fit. All numbers come '
-        'from real match event data (free StatsBomb Open Data), not from video.</p>', unsafe_allow_html=True)
+        '<p style="color:#b9c8e0;max-width:760px">Tell the app which team you are recruiting for. It reads the '
+        'team\'s formation and way of playing, finds the positions that need strengthening, and ranks players on how '
+        'well they would fit that system and whether they would improve the current starter. All numbers come from '
+        'real match event data (free StatsBomb Open Data), not from video.</p>', unsafe_allow_html=True)
     with st.expander("What this can and can't tell you"):
         st.markdown(
             "- **Passing, pressing, carrying and shooting** are counted from real match events.\n"
-            "- **Work rate and pace are proxies.** Event data has no distance run or sprint speed, so "
-            "work rate uses pressures, recoveries and counter-presses, and pace uses progressive carries, "
-            "carry distance and dribbles.\n"
-            "- Players are compared **only with others in the same position group**, as percentiles.\n"
-            "- The free data covers selected competitions only, and a few matches means a small sample. "
-            "Use the result to build a shortlist to watch, not as a final verdict."
+            "- **Work rate and pace are proxies.** Event data has no distance run or sprint speed.\n"
+            "- **A team's playstyle and formation come from its real matches** in the data. If your team is not in the "
+            "data, describe it by hand; you still get the style-aware ranking, just no squad analysis.\n"
+            "- Players are compared **only with others in the same position group**, as percentiles. If you load "
+            "several competitions, players are compared across leagues of different strength.\n"
+            "- Players with few minutes are pulled towards average (the small-sample adjustment), because per-90 "
+            "numbers from a short spell are unreliable.\n"
+            "- Goalkeepers are not scored: their job is not captured by these event metrics.\n"
+            "- The free data covers selected competitions only. Use the result to build a shortlist to watch, not as a final verdict."
         )
 
     # ---------- 1. data ----------
@@ -968,109 +1044,207 @@ def render_scouting_tab():
         selections = list(zip(picked["competition_id"], picked["season_id"]))
         bar = st.progress(0.0, text="Starting...")
         try:
-            profiles, skipped = scouting.build_dataset(
+            dataset = scouting.build_dataset(
                 selections, DATA_CACHE_DIR, int(max_matches) or None,
                 progress=lambda i, n: bar.progress(i / n, text=f"Match {i} of {n}"),
             )
-            st.session_state["profiles"] = profiles
-            st.session_state["skipped"] = skipped
+            st.session_state["profiles"] = dataset["profiles"]
+            st.session_state["teams"] = dataset["teams"]
+            st.session_state["skipped"] = dataset["skipped"]
             st.session_state["competitions_loaded"] = len(chosen)
         except Exception as e:
             st.error(f"Could not download match data: {e}")
         bar.empty()
 
     profiles = st.session_state.get("profiles")
+    teams = st.session_state.get("teams", pd.DataFrame())
     if profiles is None:
         st.info("Choose competitions and click **Load player data** to begin.")
         return
     if profiles.empty:
         st.warning("No player data was loaded.")
         return
+    n_comps = st.session_state.get("competitions_loaded", len(chosen))
     ui.render(ui.tiles([
         (len(profiles), "players loaded"),
-        (profiles["team"].nunique(), "teams"),
-        (st.session_state.get("competitions_loaded", len(chosen)),
-         "competition" if st.session_state.get("competitions_loaded", len(chosen)) == 1 else "competitions"),
+        (len(teams), "teams"),
+        (n_comps, "competition" if n_comps == 1 else "competitions"),
         (int(profiles["matches"].max()), "most matches by one player"),
     ]))
     if st.session_state.get("skipped"):
         st.caption(f"{st.session_state['skipped']} matches could not be read.")
+    if (profiles["missing_data"] != "").any():
+        n_missing = int((profiles["missing_data"] != "").sum())
+        st.caption(f"{n_missing} players come from matches without full event data (for example pressing or xG). "
+                   "Those measurements show as n/a and count as average, never as zero.")
 
-    # ---------- 2. requirements ----------
+    # ---------- 2. your team ----------
+    ctx = team_card(teams)
+
+    overview, need_group = None, None
+    if ctx["source"] == "data":
+        overview = tc.squad_overview(profiles, ctx["name"], ctx["scores"], ctx["formation"], ctx["slots"])
+        need_group = squad_needs(overview)
+
+    # ---------- 3. requirements ----------
+    team_key = (ctx["source"], ctx["name"], ctx["formation"])
+    st.session_state.setdefault("scout_group", "Winger")
+    if st.session_state.get("scout_team_key") != team_key:
+        st.session_state["scout_team_key"] = team_key
+        if need_group:
+            st.session_state["scout_group"] = need_group      # start from the team's biggest need
     with st.container(border=True):
-        st.markdown("##### 2 · Your requirements")
+        st.markdown("##### 3 · What are you looking for?")
         c1, c2, c3 = st.columns(3, gap="large")
         with c1:
-            group = st.selectbox("Position you are recruiting for", scouting.POSITION_GROUPS, index=5)
+            group = st.selectbox("Position you are recruiting for", scouting.POSITION_GROUPS, key="scout_group")
         with c2:
-            style = st.selectbox("How does your team play?", list(scouting.STYLE_WEIGHTS))
+            style_mode = st.selectbox(
+                "Playstyle to scout for", ["Match my team's playstyle"] + list(scouting.STYLE_WEIGHTS),
+                help="The first option judges players on how your team actually plays. The others override it.")
         with c3:
             min_minutes = st.slider("Minimum minutes played", 0, 900, 180, step=30)
+        o1, o2 = st.columns(2, gap="large")
+        with o1:
+            versatile = st.checkbox("Include players who can also play this position", value=False,
+                                    help="Counts players who spent a real share of their minutes here without it being their main position.")
+        with o2:
+            adjust = st.checkbox("Adjust for small samples (recommended)", value=True,
+                                 help="Pulls scores of players with few minutes towards average.")
 
-        base = scouting.default_weights(group, style)
-        metric_keys = list(scouting.RATE_METRICS) + list(scouting.OTHER_METRICS)
+        if style_mode == "Match my team's playstyle":
+            scores = ctx["scores"]
+        else:
+            scores = {s: (100.0 if s == style_mode else 0.0) for s in tc.STYLES}
+            if style_mode == "Balanced":
+                scores = {s: 50.0 for s in tc.STYLES}
+        if ctx["slots"].get(group, 0) < 0.5:
+            st.warning(f"A {ctx['formation']} does not usually have a starting {group.lower()}. You can still scout "
+                       "for one, but check that it matches how you plan to play.")
+
+        base = tc.team_weights(group, scores, ctx["formation"], "both")
         weights = {}
+        metric_keys = list(scouting.RATE_METRICS) + list(scouting.OTHER_METRICS)
         with st.expander("Fine-tune what matters (-1 = lower is better, 0 = ignore, 1 = very important)"):
             cols = st.columns(2)
             for i, metric in enumerate(metric_keys):
                 with cols[i % 2]:
                     weights[metric] = st.slider(
                         scouting.METRIC_LABELS[metric], -1.0, 1.0, float(base.get(metric, 0.0)), 0.1,
-                        key=f"w_{group}_{style}_{metric}", help=scouting.METRIC_HELP[metric],
-                    )
+                        key=f"w_{ctx['source']}_{ctx['name']}_{ctx['formation']}_{style_mode}_{group}_{metric}",
+                        help=scouting.METRIC_HELP[metric])
 
-    # ---------- 3. results ----------
-    table, pct, raw = scouting.fit_scores(profiles, group, weights, min_minutes)
-    if table.empty:
+    # ---------- 4. results ----------
+    result = tc.candidate_ranking(profiles, group, scores, ctx["formation"], team=ctx["name"],
+                                  min_minutes=min_minutes, include_versatile=versatile, small_sample_adjust=adjust)
+    if result is None:
         st.warning("No players match these filters. Lower the minimum minutes or load more matches.")
         return
+    # re-rank with the fine-tuned weights, keeping the team comparison columns
+    table, pct, raw = scouting.fit_scores(profiles, group, weights, min_minutes, versatile, adjust)
+    if table.empty:
+        st.warning("Give at least one measurement a weight other than zero.")
+        return
+    starter = result["starter"]
+    if ctx["name"] is not None:
+        keep = (table["team"] != ctx["name"]).to_numpy()
+        table, pct, raw = (x[keep].reset_index(drop=True) for x in (table, pct, raw))
+        if table.empty:
+            st.warning("No players from other teams match these filters.")
+            return
+    extra = result["table"].set_index("player_id")[["role_score", "style_score"]]
+    table["role_score"] = table["player_id"].map(extra["role_score"])
+    table["style_score"] = table["player_id"].map(extra["style_score"])
+    if starter is not None:
+        own = scouting.fit_scores(profiles, group, weights, min_minutes, versatile, adjust)[0]
+        own = own[own["player_id"] == starter["player_id"]]
+        starter_score = float(own["fit_score"].iloc[0]) if not own.empty else float(starter["fit_score"])
+        table["vs_starter"] = (table["fit_score"] - starter_score).round(1)
+        table["verdict"] = np.select([table["vs_starter"] >= 10, table["vs_starter"] >= 0],
+                                     ["Clear upgrade", "Marginal upgrade"], "Not an upgrade")
+    else:
+        table["vs_starter"], table["verdict"] = np.nan, "No current starter to compare with"
+
     if len(table) < 8:
         st.warning(f"Only {len(table)} players are in this comparison group, so percentiles are rough.")
 
-    st.markdown(f"### Top picks · {group.lower()}s for a {style.lower()} team")
-    lead = max((m for m in weights if weights[m] != 0 and m in raw.columns), key=lambda m: weights[m], default=None)
+    st.markdown(f"### Top picks · {group.lower()}s for {ctx['name'] or 'your team'}")
+    if starter is not None:
+        ui.render(ui.note(f"Compared with your current {group.lower()}: {starter['player']} "
+                          f"({int(starter['minutes'])} minutes). 'vs starter' is the fit-score difference."))
+    elif ctx["source"] == "data":
+        st.caption(f"{ctx['name']} has no {group.lower()} with enough minutes in the data to compare against.")
+    only_upgrades = False
+    if starter is not None:
+        only_upgrades = st.checkbox("Only show players who would improve on the current starter", value=False)
+    if only_upgrades:
+        keep = (table["vs_starter"] > 0).to_numpy()
+        table, pct, raw = (x[keep].reset_index(drop=True) for x in (table, pct, raw))
+        if table.empty:
+            st.info("Nobody in the data would clearly improve on the current starter with these settings.")
+            return
+    table = table.sort_values("fit_score", ascending=False)
+    pct, raw = pct.loc[table.index].reset_index(drop=True), raw.loc[table.index].reset_index(drop=True)
+    table = table.reset_index(drop=True)
+
     cards = []
     for i in range(min(3, len(table))):
         r = table.iloc[i]
-        stats = [(f"{int(r['minutes'])}", "minutes")]
-        if lead:
-            stats.append((finite(raw.loc[i, lead], "{:.1f}"), scouting.METRIC_LABELS[lead].lower() + "/90"
-                          if lead.endswith("_p90") else scouting.METRIC_LABELS[lead].lower()))
+        stats = [(finite(r["role_score"], "{:.0f}"), "role fit"), (finite(r["style_score"], "{:.0f}"), "style fit")]
+        stats.append((finite(r["vs_starter"], "{:+.0f}") if starter is not None else f"{int(r['minutes'])}",
+                      "vs starter" if starter is not None else "minutes"))
         cards.append({"title": r["player"], "sub": " · ".join(x for x in (r["team"], r["position"]) if x),
                       "photo_uri": None, "fallback": ui.initials(r["player"]),
                       "score": float(r["fit_score"]), "stats": stats})
     ui.render(ui.picks(cards))
 
     top_n = st.slider("Players to show", 5, 50, min(15, len(table))) if len(table) > 5 else len(table)
-    shown = table.head(top_n).rename(columns={
-        "player": "Player", "team": "Team", "position": "Position",
-        "minutes": "Minutes", "fit_score": "Fit score (0-100)"})
+    columns = ["player", "team", "position", "minutes", "fit_score", "role_score", "style_score"]
+    if starter is not None:
+        columns += ["vs_starter", "verdict"]
+    columns += ["reliability"]
+    shown = table.head(top_n)[columns].rename(columns={
+        "player": "Player", "team": "Team", "position": "Position", "minutes": "Minutes",
+        "fit_score": "Fit score (0-100)", "role_score": "Role fit", "style_score": "Style fit",
+        "vs_starter": "vs starter", "verdict": "Verdict", "reliability": "Sample"})
     with st.expander("Full shortlist and export", expanded=True):
         st.dataframe(shown, width="stretch", hide_index=True, column_config={
             "Fit score (0-100)": st.column_config.ProgressColumn(
-                "Fit score (0-100)", min_value=0, max_value=100, format="%.0f")})
+                "Fit score (0-100)", min_value=0, max_value=100, format="%.0f"),
+            "Role fit": st.column_config.NumberColumn("Role fit", format="%.0f"),
+            "Style fit": st.column_config.NumberColumn("Style fit", format="%.0f")})
         st.download_button("📥 Download shortlist (CSV)", shown.to_csv(index=False), "shortlist.csv", "text/csv")
 
     st.markdown("### Player report")
     name = st.selectbox("Player", shown["Player"].tolist())
     i = int(table.index[table["player"] == name][0])
+    row = table.loc[i]
     with st.container(border=True):
-        sub = " · ".join(x for x in (table.loc[i, "team"], table.loc[i, "position"],
-                                     f"{int(table.loc[i, 'minutes'])} minutes") if x)
-        ui.render(ui.report_header(name, sub, float(table.loc[i, "fit_score"])))
+        sub = " · ".join(x for x in (row["team"], row["position"], f"{int(row['minutes'])} minutes") if x)
+        ui.render(ui.report_header(name, sub, float(row["fit_score"])))
         strengths, gaps = vm.strengths_gaps(pct.loc[i], weights, labels=scouting.METRIC_LABELS, min_gap_weight=0.3)
-        chip_html = ui.chips([f"▲ {label} · {p:.0f}" for label, p in strengths], "good") if strengths else ""
+        chip_html = ""
+        if starter is not None and pd.notna(row["vs_starter"]):
+            kind = "good" if row["vs_starter"] >= 10 else ("neutral" if row["vs_starter"] >= 0 else "warn")
+            chip_html += ui.chips([f"{row['verdict']} · {row['vs_starter']:+.0f} vs {starter['player']}"], kind)
+        chip_html += ui.chips([f"Role fit {row['role_score']:.0f}", f"Style fit {row['style_score']:.0f}"], "neutral")
+        chip_html += ui.chips([f"▲ {label} · {p:.0f}" for label, p in strengths], "good") if strengths else ""
         chip_html += ui.chips([f"▼ {label} · {p:.0f}" for label, p in gaps], "warn") if gaps else ""
-        if table.loc[i, "minutes"] < 450:
-            chip_html += ui.chips([f"Small sample · {int(table.loc[i, 'minutes'])} minutes"], "neutral")
-        if not strengths and not gaps:
-            chip_html += ui.chips(["No standout strengths or gaps"], "neutral")
+        also = [g for g in row["groups_played"] if g != row["position_group"]]
+        if row["position_group"] != group:
+            chip_html += ui.chips([f"Main position: {row['position_group']}"], "neutral")
+        elif also:
+            chip_html += ui.chips([f"Can also play: {', '.join(also)}"], "neutral")
+        if row["reliability"] != "High":
+            chip_html += ui.chips([f"{row['reliability']} sample · {int(row['minutes'])} minutes"], "neutral")
+        if row["missing_data"]:
+            chip_html += ui.chips([f"No data for: {row['missing_data']}"], "warn")
         ui.render(chip_html)
         rows = [(scouting.METRIC_LABELS[m], float(pct.loc[i, m]), finite(raw.loc[i, m], "{:.2f}"),
                  f"importance {weights[m]:+.1f}") for m in pct.columns]
         ui.render(ui.bars(rows))
         st.caption("Percentiles compare this player with others in the same position group. "
-                   "Bar colour: green = strong, blue = middle, amber = weak.")
+                   "Bar colour: green = strong, blue = middle, amber = weak. n/a data counts as average.")
 
 
 # =====================================================
