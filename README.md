@@ -1,140 +1,29 @@
-# ⚽ Player Tracking System
+# ⚽ Player Scouting & Tracking
 
-Real-time player detection, tracking, and analysis from video files.
+> Find the right player for your team from match video and real match data. A university project prototype.
 
-## Features
+Upload match highlights (for example from YouTube), say what kind of player you need, and the app finds the players on screen, estimates how each one moves, ranks them against your requirement, and shows the best fits in a highlighted replay. A second tab scouts from real match data, judging players against **your team's formation and playstyle** and checking whether they would improve your current starters.
 
-✅ **Real-time Detection** - YOLOv8 person detection  
-✅ **Persistent Tracking** - Deep SORT multi-object tracking  
-✅ **Shirt Number OCR** - Automatic shirt number extraction  
-✅ **Team Detection** - Color-based team classification  
-✅ **Live Preview** - Watch detection as it happens  
-✅ **Statistics** - Frame counts, detection rates, CSV export  
+## What it does
 
-## Requirements
+- **🎥 Analyse a video:** detects and tracks players, estimates speed, distance, high-intensity running and pressing, groups them into teams by shirt colour, and ranks them with a photo for each player.
+- **📊 Data scouting:** reads a team's formation and playstyle from real matches (free StatsBomb Open Data), finds the positions that need strengthening, and ranks candidates by role fit, style fit and whether they beat the current starter.
 
-- Python 3.9+
-- 2GB free disk space (for models)
-- 4GB+ RAM recommended
+## Quick start
 
-## Quick Start
-
-### 1. Create Virtual Environment
-
-**Windows:**
 ```bash
 python -m venv venv
-venv\Scripts\activate
+venv\Scripts\activate                # Mac/Linux: source venv/bin/activate
+pip install -r player-tracker-project/requirements.txt
+.\start.bat                          # Mac/Linux: ./start.sh
 ```
 
-**Mac/Linux:**
-```bash
-python3 -m venv venv
-source venv/bin/activate
-```
+The app opens at `http://localhost:8501`. Full instructions, settings and troubleshooting are in [`player-tracker-project/README.md`](player-tracker-project/README.md).
 
-### 2. Install Dependencies
+## Built with
 
-```bash
-pip install -r requirements.txt
-```
+Python · Streamlit · YOLOv8 · Deep SORT · OpenCV · EasyOCR · StatsBomb Open Data
 
-*First install takes 5-10 minutes (downloads models)*
+## Status and limits
 
-### 3. Run Application
-
-```bash
-streamlit run player_tracker_final.py
-```
-
-Browser opens at: `http://localhost:8501`
-
-## Usage
-
-1. **Upload Video** - MP4/AVI/MOV/MKV format
-2. **Click Process** - App detects and tracks players
-3. **Watch Live Preview** - See bounding boxes in real-time
-4. **View Statistics** - Get final player stats
-5. **Download CSV** - Export results
-
-## Video Requirements
-
-- **Format:** MP4, AVI, MOV, MKV
-- **Resolution:** 480p-1080p recommended
-- **Duration:** 1-5 minutes ideal
-- **Codec:** H.264 or similar
-
-## Output Statistics
-
-- Player ID (persistent tracking)
-- Shirt Number (OCR detected)
-- Team (color detected)
-- Frames Detected (appearance count)
-- Detection Rate (%)
-
-## Troubleshooting
-
-### "ModuleNotFoundError"
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt --no-cache-dir
-```
-
-### Port 8501 Already in Use
-```bash
-streamlit run player_tracker_final.py --server.port 8502
-```
-
-### First Run is Slow
-- Normal behavior, models download automatically
-- Subsequent runs are faster (cached)
-
-### No Players Detected
-- Try different video with better visibility
-- Ensure people are clearly visible in frame
-- Check video quality
-
-### OCR Not Reading Shirt Numbers
-- Works best with clear, straight-on numbers
-- Lighting affects accuracy
-- This is a known OCR limitation
-
-## Project Structure
-
-```
-player-tracker-project/
-├── player_tracker_final.py    (Main app)
-├── requirements.txt            (Dependencies)
-├── README.md                   (This file)
-├── check_setup.py             (Verification script)
-├── setup.py                   (Auto setup script)
-└── venv/                      (Virtual environment)
-```
-
-## Models Used
-
-- **YOLOv8 Medium** - Person detection
-- **EasyOCR** - Shirt number extraction
-- **DeepSort** - Player tracking
-- **MobileNet** - Feature extraction
-
-## Performance
-
-- 1-minute video: ~2-3 minutes processing
-- 5-minute video: ~10-15 minutes processing
-- Depends on resolution and CPU
-
-## Notes
-
-- Tracking ID is consistent for same player across frames
-- Team detection accuracy depends on jersey colors
-- OCR accuracy improves with clear shirt numbers
-- Works on CPU (GPU optional)
-
-## Support
-
-Check SETUP_GUIDE.md for detailed troubleshooting.
-
----
-
-**Status:** Production Ready ✅
+This is a working prototype for demonstration, not production software. Speed and distance from video are estimates, pressing is a proxy (the ball is not tracked), and passing and exact position cannot be measured from highlight clips. An optional demo mode adds clearly labelled simulated details; everything simulated is marked "(demo)" and never changes the fit score.
