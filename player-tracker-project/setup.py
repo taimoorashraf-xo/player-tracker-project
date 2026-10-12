@@ -9,6 +9,8 @@ import sys
 import os
 import platform
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+
 def run_command(cmd, description=""):
     """Run shell command"""
     if description:
@@ -42,20 +44,20 @@ def main():
     print("⏳ This may take 5-10 minutes...")
     
     success = run_command(
-        f"{sys.executable} -m pip install -r requirements.txt",
+        f"{sys.executable} -m pip install -r \"{os.path.join(HERE, 'requirements.txt')}\"",
         "Installing dependencies"
     )
     
     if not success:
         print("\n⚠️  Installation had issues. Trying alternative method...")
         run_command(
-            f"{sys.executable} -m pip install -r requirements.txt --no-cache-dir",
+            f"{sys.executable} -m pip install -r \"{os.path.join(HERE, 'requirements.txt')}\" --no-cache-dir",
             "Retrying without cache"
         )
     
     # Step 3: Verify installation
     print("\nSTEP 3: Verifying installation...")
-    run_command(f"{sys.executable} check_setup.py", "Running diagnostics")
+    run_command(f"{sys.executable} \"{os.path.join(HERE, 'check_setup.py')}\"", "Running diagnostics")
     
     # Success message
     print("\n" + "="*60)
