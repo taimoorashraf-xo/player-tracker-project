@@ -30,7 +30,7 @@ FORMATION_SLOTS = {
     "5-4-1": {"Centre-back": 3, "Full-back": 2, "Central midfielder": 2, "Winger": 2, "Forward": 1},
 }
 FORMATIONS = list(FORMATION_SLOTS)
-NEED_THRESHOLDS = (50, 80)   # starter percentile below 50 = priority, 80 or more = strong
+NEED_THRESHOLDS = (45, 75)   # starter percentile below 45 = priority, 75 or more = strong
 MIN_TEAMS_FOR_PERCENTILES = 6
 
 
