@@ -4,7 +4,8 @@ venv/
 __pycache__/
 *.pyc
 
-# Extra YOLO weights are downloaded on first use (yolov8m.pt is committed)
+# Detector weights download on first use; they do not belong in version control
 yolov8n.pt
 yolov8s.pt
+yolov8m.pt
 data_cache/

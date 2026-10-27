@@ -1,6 +1,7 @@
 # Local tool configuration and environments: never commit these
+*.pyc
+.idea/
 .mcp.json
 .venv/
-venv/
 __pycache__/
-*.pyc
+venv/

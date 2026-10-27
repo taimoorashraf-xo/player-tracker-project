@@ -52,9 +52,9 @@ def main():
         ("PyTorch", "torch"),
         ("torchvision", "torchvision"),
         ("DeepSort", "deep_sort_realtime"),
-        ("SciPy", "scipy"),
         ("Pillow", "PIL"),
         ("StatsBombPy", "statsbombpy"),
+        ("SciPy", "scipy"),
         ("imageio", "imageio"),
         ("imageio-ffmpeg", "imageio_ffmpeg"),
     ]
